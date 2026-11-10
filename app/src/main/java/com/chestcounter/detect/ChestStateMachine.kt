@@ -1,73 +1,96 @@
 package com.chestcounter.detect
 
-enum class Observation { NONE, CLOSED, OPEN }
+enum class ChestState { IDLE, CLOSED_SEEN, COOLDOWN }
 
-class ChestStateMachine(
-    private val confirmFrames: Int = 3,
-    private val cooldownMs: Long = 3000L,
-    private val resetFrames: Int = 5,
-    private val armTimeoutFrames: Int = 20
-) {
-    private enum class State { IDLE, ARMED, COUNTED }
+data class Observation(
+    val timeMs: Long,
+    val closedScore: Float,
+    val openScore: Float
+)
 
-    private var state = State.IDLE
-    private var closedStreak = 0
-    private var openStreak = 0
-    private var calmStreak = 0
-    private var noneStreak = 0
-    private var lastCountMs: Long? = null
+data class StateConfig(
+    val closedThreshold: Float = 0.70f,
+    val openThreshold: Float = 0.70f,
+    val closedStableMs: Long = 300L,
+    val openStableMs: Long = 300L,
+    val maxClosedToOpenMs: Long = 4000L,
+    val cooldownMs: Long = 5000L,
+    val rearmGapMs: Long = 1500L,
+    val gapToleranceMs: Long = 250L
+)
 
-    /** Retourne true seulement quand un nouveau coffre vient d'être compté. */
-    fun update(obs: Observation, nowMs: Long): Boolean {
+/**
+ * Machine à états sans dépendance Android (donc testable).
+ * Un coffre est compté seulement si : "fermé" stable, puis "ouvert" stable
+ * dans un délai court. Ensuite : pause, puis réarmement uniquement
+ * quand ni fermé ni ouvert n'est visible pendant un moment.
+ */
+class ChestStateMachine(private val cfg: StateConfig = StateConfig()) {
+
+    var state: ChestState = ChestState.IDLE
+        private set
+    var count: Int = 0
+        private set
+    var lastConfidence: Float = 0f
+        private set
+
+    private val closedStreak = Streak(cfg.gapToleranceMs)
+    private val openStreak = Streak(cfg.gapToleranceMs)
+    private var lastClosedAt = -1L
+    private var closedPeak = 0f
+    private var cooldownUntil = 0L
+    private var noneSince = -1L
+
+    /** Retourne true uniquement au moment où un nouveau coffre est compté. */
+    fun process(o: Observation): Boolean {
+        val t = o.timeMs
+        val closedNow = o.closedScore >= cfg.closedThreshold && o.closedScore > o.openScore
+        val openNow = o.openScore >= cfg.openThreshold && o.openScore > o.closedScore
+
+        val closedDur = closedStreak.update(closedNow, t)
+        val openDur = openStreak.update(openNow, t)
+
         when (state) {
-            State.IDLE -> {
-                if (obs == Observation.CLOSED) {
-                    closedStreak++
-                    if (closedStreak >= confirmFrames) {
-                        state = State.ARMED
-                        closedStreak = 0
-                        openStreak = 0
-                        noneStreak = 0
-                    }
-                } else {
-                    closedStreak = 0
+            ChestState.IDLE -> {
+                if (closedDur >= cfg.closedStableMs) {
+                    state = ChestState.CLOSED_SEEN
+                    lastClosedAt = t
+                    closedPeak = o.closedScore
                 }
             }
 
-            State.ARMED -> {
-                when (obs) {
-                    Observation.OPEN -> {
-                        noneStreak = 0
-                        openStreak++
-                        if (openStreak >= confirmFrames) {
-                            state = State.COUNTED
-                            calmStreak = 0
-                            openStreak = 0
-                            val last = lastCountMs
-                            if (last == null || nowMs - last >= cooldownMs) {
-                                lastCountMs = nowMs
-                                return true
-                            }
+            ChestState.CLOSED_SEEN -> {
+                if (closedNow) {
+                    lastClosedAt = t
+                    if (o.closedScore > closedPeak) closedPeak = o.closedScore
+                }
+                if (openDur >= cfg.openStableMs && t - lastClosedAt <= cfg.maxClosedToOpenMs) {
+                    count++
+                    lastConfidence = (closedPeak + o.openScore) / 2f
+                    state = ChestState.COOLDOWN
+                    cooldownUntil = t + cfg.cooldownMs
+                    noneSince = -1L
+                    closedStreak.reset()
+                    openStreak.reset()
+                    return true
+                } else if (t - lastClosedAt > cfg.maxClosedToOpenMs) {
+                    state = ChestState.IDLE
+                    closedStreak.reset()
+                }
+            }
+
+            ChestState.COOLDOWN -> {
+                if (t >= cooldownUntil) {
+                    if (!closedNow && !openNow) {
+                        if (noneSince < 0) noneSince = t
+                        if (t - noneSince >= cfg.rearmGapMs) {
+                            state = ChestState.IDLE
+                            closedStreak.reset()
+                            openStreak.reset()
                         }
+                    } else {
+                        noneSince = -1L
                     }
-                    Observation.CLOSED -> {
-                        openStreak = 0
-                        noneStreak = 0
-                    }
-                    Observation.NONE -> {
-                        openStreak = 0
-                        noneStreak++
-                        if (noneStreak >= armTimeoutFrames) reset()
-                    }
-                }
-            }
-
-            State.COUNTED -> {
-                if (obs == Observation.OPEN) {
-                    calmStreak = 0
-                } else {
-                    calmStreak++
-                    if (calmStreak >= resetFrames) reset()
                 }
             }
         }
@@ -75,10 +98,34 @@ class ChestStateMachine(
     }
 
     fun reset() {
-        state = State.IDLE
-        closedStreak = 0
-        openStreak = 0
-        calmStreak = 0
-        noneStreak = 0
+        state = ChestState.IDLE
+        count = 0
+        lastConfidence = 0f
+        lastClosedAt = -1L
+        closedPeak = 0f
+        cooldownUntil = 0L
+        noneSince = -1L
+        closedStreak.reset()
+        openStreak.reset()
+    }
+
+    private class Streak(private val toleranceMs: Long) {
+        private var start = -1L
+        private var lastHit = -1L
+
+        fun update(hit: Boolean, t: Long): Long {
+            if (hit) {
+                if (start < 0 || t - lastHit > toleranceMs) start = t
+                lastHit = t
+                return t - start
+            }
+            if (start >= 0 && t - lastHit > toleranceMs) start = -1L
+            return if (start >= 0) lastHit - start else 0L
+        }
+
+        fun reset() {
+            start = -1L
+            lastHit = -1L
+        }
     }
 }
