@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.chestcounter.capture.CaptureService
 import com.chestcounter.data.AppDb
+import com.chestcounter.data.CaptureCollector
 import com.chestcounter.data.ChestEvent
 import com.chestcounter.data.ChestGoal
 import com.chestcounter.detect.TemplateKind
@@ -115,6 +116,9 @@ class MainActivity : ComponentActivity() {
         var zb by remember { mutableStateOf(75) }
         var countdown by remember { mutableStateOf("") }
         var confirmAll by remember { mutableStateOf(false) }
+        var collectOn by remember {
+            mutableStateOf(CaptureCollector.isEnabled(applicationContext))
+        }
 
         val notifLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
@@ -269,6 +273,43 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(6.dp))
                     T(status.message, 13, VioletLight)
                 }
+            }
+
+            Card("Collecte de captures") {
+                T(
+                    if (collectOn) "Activée" else "Désactivée",
+                    16,
+                    if (collectOn) Ok else Dim,
+                    true
+                )
+                Spacer(Modifier.height(6.dp))
+                T(
+                    "Enregistre des images de tout l'écran dans Pictures/ChestCounter " +
+                        "(coffre compté, cas ambigus, une image de fond toutes les 15 s). " +
+                        "Maximum 300 par session. Classement provisoire, à vérifier à la main.",
+                    12, Dim
+                )
+                Spacer(Modifier.height(8.dp))
+                Btn(
+                    if (collectOn) "Désactiver la collecte" else "Activer la collecte",
+                    Modifier.fillMaxWidth(),
+                    primary = !collectOn
+                ) {
+                    collectOn = !collectOn
+                    CaptureCollector.setEnabled(applicationContext, collectOn)
+                }
+                Spacer(Modifier.height(8.dp))
+                T("Images enregistrées cette session : ${status.savedCaptures}", 13)
+                if (status.collectorError.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    T("Erreur de collecte : ${status.collectorError}", 12, Warn)
+                }
+                Spacer(Modifier.height(6.dp))
+                T(
+                    "Attention : tout ce qui est à l'écran est enregistré. " +
+                        "Active la collecte seulement pendant que tu joues.",
+                    11, Warn
+                )
             }
 
             Card("Calibration") {
