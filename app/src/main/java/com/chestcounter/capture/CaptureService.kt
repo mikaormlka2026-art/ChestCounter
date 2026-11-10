@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -33,9 +34,10 @@ import com.chestcounter.data.CaptureCollector
 import com.chestcounter.data.ChestEvent
 import com.chestcounter.data.ChestGoal
 import com.chestcounter.detect.ChestDetector
-import com.chestcounter.detect.ChestStateMachine
-import com.chestcounter.detect.Observation
+import com.chestcounter.detect.ColorDetector
 import com.chestcounter.detect.TemplateKind
+import com.chestcounter.fusion.ChestEngine
+import com.chestcounter.track.Track
 import com.chestcounter.ui.Hud
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +67,10 @@ data class CaptureStatus(
     val errorCount: Int = 0,
     val message: String = "",
     val savedCaptures: Int = 0,
-    val collectorError: String = ""
+    val collectorError: String = "",
+    val tracks: List<Track> = emptyList(),
+    val frameWidth: Int = 0,
+    val frameHeight: Int = 0
 )
 
 class CaptureService : Service() {
@@ -86,16 +91,21 @@ class CaptureService : Service() {
     private var collector: CaptureCollector? = null
     private var framePool: FramePool? = null
     private var hud: Hud? = null
-    private val machine = ChestStateMachine()
+    private val engine = ChestEngine()
+    private val colorDetector = ColorDetector()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
     private var pending: PendingTemplate? = null
+
+    @Volatile
+    private var needsReset = false
     private var stopping = false
     private var lastProcessAt = 0L
     private var frames = 0
     private var errors = 0
+    private var lastPhase = "IDLE"
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -109,6 +119,11 @@ class CaptureService : Service() {
             }
         }
         return START_NOT_STICKY
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        resizeCapture()
     }
 
     override fun onDestroy() {
@@ -195,7 +210,9 @@ class CaptureService : Service() {
         collector = CaptureCollector(applicationContext)
         framePool = FramePool()
 
-        machine.reset()
+        engine.reset()
+        needsReset = false
+        lastPhase = "IDLE"
         frames = 0
         errors = 0
         lastProcessAt = 0L
@@ -213,6 +230,28 @@ class CaptureService : Service() {
         }
 
         startHud()
+    }
+
+    private fun resizeCapture() {
+        val vd = virtualDisplay ?: return
+        val looper = thread?.looper ?: return
+        try {
+            val (w, h, dpi) = captureSize()
+            val old = imageReader
+            if (old != null && old.width == w && old.height == h) return
+
+            val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            reader.setOnImageAvailableListener({ r -> onFrame(r) }, Handler(looper))
+            vd.resize(w, h, dpi)
+            vd.surface = reader.surface
+            imageReader = reader
+            needsReset = true
+
+            old?.setOnImageAvailableListener(null, null)
+            old?.close()
+        } catch (t: Throwable) {
+            publish { it.copy(message = "Rotation : ${t.message}") }
+        }
     }
 
     private fun startHud() {
@@ -263,6 +302,12 @@ class CaptureService : Service() {
     private fun process(bmp: Bitmap, now: Long) {
         val d = detector ?: return
 
+        if (needsReset) {
+            needsReset = false
+            engine.reset()
+            lastPhase = "IDLE"
+        }
+
         val p = pending
         if (p != null) {
             pending = null
@@ -290,9 +335,14 @@ class CaptureService : Service() {
             return
         }
 
-        val counted = machine.process(Observation(now, r.closedScore, r.openScore))
-        if (counted) {
-            val confidence = machine.lastConfidence
+        val out = engine.process(r.detections, now) { box -> colorDetector.score(bmp, box) }
+
+        for (e in out.events) lastPhase = e.to.name
+        if (out.tracks.isEmpty()) lastPhase = "IDLE"
+
+        val counted = out.newlyCounted.isNotEmpty()
+        for (c in out.newlyCounted) {
+            val confidence = c.confidence
             scope.launch {
                 try {
                     AppDb.get(applicationContext).chestDao().insert(
@@ -319,14 +369,17 @@ class CaptureService : Service() {
                 openScore = r.openScore,
                 processingMs = r.processingMs,
                 framesProcessed = frames,
-                sessionCount = machine.count,
-                machineState = machine.state.name,
+                sessionCount = engine.count,
+                machineState = lastPhase,
                 hasTemplates = true,
-                lastConfidence = machine.lastConfidence,
+                lastConfidence = engine.lastConfidence,
                 errorCount = errors,
                 message = if (counted) "Coffre compté" else "",
                 savedCaptures = savedCount,
-                collectorError = colError
+                collectorError = colError,
+                tracks = out.tracks,
+                frameWidth = bmp.width,
+                frameHeight = bmp.height
             )
         }
     }
@@ -364,7 +417,8 @@ class CaptureService : Service() {
         val crop = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
         val ok = d.saveTemplate(templatesDir(), p.kind, crop)
         crop.recycle()
-        machine.reset()
+        engine.reset()
+        lastPhase = "IDLE"
         publish {
             it.copy(
                 hasTemplates = d.hasTemplates(),
