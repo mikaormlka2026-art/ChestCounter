@@ -1,9 +1,12 @@
 package com.chestcounter.capture
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
@@ -20,281 +23,437 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
+import android.util.DisplayMetrics
+import android.view.WindowManager
+import androidx.core.app.NotificationCompat
 import com.chestcounter.R
 import com.chestcounter.data.AppDb
 import com.chestcounter.data.ChestEvent
+import com.chestcounter.data.ChestGoal
 import com.chestcounter.detect.ChestDetector
 import com.chestcounter.detect.ChestStateMachine
 import com.chestcounter.detect.Observation
+import com.chestcounter.detect.TemplateKind
 import com.chestcounter.ui.Hud
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 
+/** État visible par l'écran principal et le HUD (diagnostic). */
+data class CaptureStatus(
+    val running: Boolean = false,
+    val closedScore: Float = 0f,
+    val openScore: Float = 0f,
+    val processingMs: Long = 0L,
+    val framesProcessed: Int = 0,
+    val sessionCount: Int = 0,
+    val machineState: String = "IDLE",
+    val hasTemplates: Boolean = false,
+    val lastConfidence: Float = 0f,
+    val errorCount: Int = 0,
+    val message: String = ""
+)
+
 class CaptureService : Service() {
 
-    companion object {
-        const val ACTION_START = "com.chestcounter.START"
-        const val ACTION_STOP = "com.chestcounter.STOP"
-        const val ACTION_CALIB_CLOSED = "com.chestcounter.CALIB_CLOSED"
-        const val ACTION_CALIB_OPEN = "com.chestcounter.CALIB_OPEN"
-        const val ACTION_CLEAR_CALIB = "com.chestcounter.CLEAR_CALIB"
-        const val ACTION_UNDO = "com.chestcounter.UNDO"
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_DATA = "data"
-
-        private const val CHANNEL_ID = "capture"
-        private const val NOTIF_ID = 1
-        private const val MAX_SIDE = 1280
-        private const val MIN_INTERVAL_MS = 200L
-
-        val running = MutableStateFlow(false)
-        val status = MutableStateFlow("")
-    }
-
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var workThread: HandlerThread? = null
-    private var workHandler: Handler? = null
+    private data class PendingTemplate(
+        val kind: TemplateKind,
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float
+    )
 
     private var projection: MediaProjection? = null
-    private var projectionCallback: MediaProjection.Callback? = null
-    private var display: VirtualDisplay? = null
-    private var reader: ImageReader? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var thread: HandlerThread? = null
     private var detector: ChestDetector? = null
-    private val machine = ChestStateMachine()
     private var hud: Hud? = null
+    private val machine = ChestStateMachine()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    @Volatile private var lastFrame: Bitmap? = null
-    private var lastRun = 0L
-    @Volatile private var total = 0
-    @Volatile private var obs = Observation.NONE
-    private var stopped = false
+    @Volatile
+    private var pending: PendingTemplate? = null
+    private var stopping = false
+    private var lastProcessAt = 0L
+    private var frames = 0
+    private var errors = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (val action = intent?.action) {
-            ACTION_START -> start(intent)
-            null -> {}
-            else -> handleAction(action)
+        when (intent?.action) {
+            ACTION_START -> startCapture(intent)
+            ACTION_STOP -> stopCapture()
+            ACTION_SAVE_TEMPLATE -> queueTemplate(intent)
+            else -> {
+                if (projection == null) stopSelf()
+            }
         }
         return START_NOT_STICKY
     }
 
-    private fun start(intent: Intent) {
-        if (projection != null) return
-        createChannel()
-        val notif = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notif_title))
-            .setContentText(getString(R.string.notif_text))
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true)
-            .build()
-        // Le service doit passer au premier plan AVANT de récupérer la projection.
-        startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-
-        val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-        val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(EXTRA_DATA)
-        }
-        if (data == null) {
-            fail("Autorisation de capture manquante")
-            return
-        }
-
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val mp = try {
-            mpm.getMediaProjection(code, data)
-        } catch (e: Exception) {
-            null
-        }
-        if (mp == null) {
-            fail("Capture refusée par Android")
-            return
-        }
-        projection = mp
-        val cb = object : MediaProjection.Callback() {
-            override fun onStop() {
-                mainHandler.post { stopAll() }
-            }
-        }
-        projectionCallback = cb
-        mp.registerCallback(cb, mainHandler)
-
-        val thread = HandlerThread("chest-work").also { it.start() }
-        workThread = thread
-        workHandler = Handler(thread.looper)
-
-        val det = ChestDetector(this)
-        if (!det.init()) {
-            fail("OpenCV n'a pas démarré")
-            return
-        }
-        detector = det
-
-        val m = resources.displayMetrics
-        val scale = min(1f, MAX_SIDE.toFloat() / max(m.widthPixels, m.heightPixels))
-        val w = (m.widthPixels * scale).toInt().coerceAtLeast(2)
-        val h = (m.heightPixels * scale).toInt().coerceAtLeast(2)
-
-        val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        reader = r
-        r.setOnImageAvailableListener({ onImage(it) }, workHandler)
-        display = mp.createVirtualDisplay(
-            "chest-capture", w, h, m.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            r.surface, null, workHandler
-        )
-
-        hud = Hud(this) { action -> handleAction(action) }.also { it.show() }
-        ioScope.launch {
-            AppDb.get(this@CaptureService).dao().totalFlow().collect {
-                total = it
-                refreshHud()
-            }
-        }
-
-        running.value = true
-        status.value = if (det.ready) "Capture active" else "Capture active : calibration à faire"
-        refreshHud()
-    }
-
-    private fun onImage(r: ImageReader) {
-        val image = try {
-            r.acquireLatestImage()
-        } catch (e: Exception) {
-            null
-        } ?: return
-        try {
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastRun < MIN_INTERVAL_MS) return
-            lastRun = now
-            val bmp = toBitmap(image)
-            lastFrame = bmp
-            val det = detector ?: return
-            val o = det.analyze(bmp)
-            obs = o
-            if (machine.update(o, now)) {
-                ioScope.launch {
-                    AppDb.get(this@CaptureService).dao()
-                        .insert(ChestEvent(timestamp = System.currentTimeMillis()))
-                }
-            }
-            refreshHud()
-        } catch (e: Exception) {
-            status.value = "Erreur d'analyse : ${e.message}"
-        } finally {
-            image.close()
-        }
-    }
-
-    private fun toBitmap(image: Image): Bitmap {
-        val plane = image.planes[0]
-        val rowPadding = plane.rowStride - plane.pixelStride * image.width
-        val full = Bitmap.createBitmap(
-            image.width + rowPadding / plane.pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        full.copyPixelsFromBuffer(plane.buffer)
-        return if (rowPadding == 0) full
-        else Bitmap.createBitmap(full, 0, 0, image.width, image.height)
-    }
-
-    private fun handleAction(action: String) {
-        when (action) {
-            ACTION_STOP -> mainHandler.post { stopAll() }
-            ACTION_CALIB_CLOSED -> calibrate(isOpen = false)
-            ACTION_CALIB_OPEN -> calibrate(isOpen = true)
-            ACTION_CLEAR_CALIB -> workHandler?.post {
-                detector?.clearTemplates()
-                machine.reset()
-                status.value = "Calibration effacée"
-                refreshHud()
-            }
-            ACTION_UNDO -> ioScope.launch {
-                AppDb.get(this@CaptureService).dao().deleteLast()
-            }
-        }
-    }
-
-    /** Enregistre la zone centrale de l'écran (25 % x 25 %) comme modèle. */
-    private fun calibrate(isOpen: Boolean) {
-        workHandler?.post {
-            val f = lastFrame
-            val det = detector
-            if (f == null || det == null) {
-                status.value = "Pas encore d'image capturée"
-                refreshHud()
-                return@post
-            }
-            val w = (f.width * 0.25f).toInt()
-            val h = (f.height * 0.25f).toInt()
-            val x = (f.width - w) / 2
-            val y = (f.height - h) / 2
-            val ok = det.saveTemplate(f, x, y, w, h, isOpen)
-            machine.reset()
-            status.value = when {
-                !ok -> "Échec de l'enregistrement"
-                isOpen -> "Modèle OUVERT enregistré"
-                else -> "Modèle FERMÉ enregistré"
-            }
-            refreshHud()
-        }
-    }
-
-    private fun refreshHud() {
-        val t = total
-        val o = obs
-        val ready = detector?.ready == true
-        val msg = status.value
-        mainHandler.post { hud?.update(t, o, ready, msg) }
-    }
-
-    private fun fail(message: String) {
-        status.value = message
-        stopAll()
-    }
-
-    private fun stopAll() {
-        if (stopped) return
-        stopped = true
-        running.value = false
-        hud?.hide()
-        hud = null
-        display?.release()
-        display = null
-        reader?.close()
-        reader = null
-        projectionCallback?.let { projection?.unregisterCallback(it) }
-        try {
-            projection?.stop()
-        } catch (_: Exception) {
-        }
-        projection = null
-        workThread?.quitSafely()
-        workThread = null
-        ioScope.cancel()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
     override fun onDestroy() {
-        stopAll()
+        stopCapture()
+        scope.cancel()
         super.onDestroy()
     }
 
+    // ---------------------------------------------------------------- démarrage
+
+    private fun startCapture(intent: Intent) {
+        if (projection != null) return
+        stopping = false
+
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+        val data = getResultData(intent)
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            publish { it.copy(running = false, message = "Autorisation de capture manquante") }
+            stopSelf()
+            return
+        }
+
+        createChannel()
+        try {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    NOTIF_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        } catch (t: Throwable) {
+            publish { it.copy(running = false, message = "Service premier plan refusé : ${t.message}") }
+            stopSelf()
+            return
+        }
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mp = try {
+            mpm.getMediaProjection(resultCode, data)
+        } catch (t: Throwable) {
+            null
+        }
+        if (mp == null) {
+            publish { it.copy(running = false, message = "Impossible d'obtenir la capture d'écran") }
+            stopCapture()
+            return
+        }
+        projection = mp
+
+        val ht = HandlerThread("ChestCapture").also { it.start() }
+        thread = ht
+        val bg = Handler(ht.looper)
+
+        // Obligatoire sur Android 14+ : callback enregistré avant le VirtualDisplay.
+        mp.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                mainHandler.post { stopCapture() }
+            }
+        }, bg)
+
+        try {
+            val (w, ch, dpi) = captureSize()
+            val reader = ImageReader.newInstance(w, ch, PixelFormat.RGBA_8888, 2)
+            imageReader = reader
+            reader.setOnImageAvailableListener({ r -> onFrame(r) }, bg)
+            virtualDisplay = mp.createVirtualDisplay(
+                "ChestCounterCapture",
+                w, ch, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface, null, bg
+            )
+        } catch (t: Throwable) {
+            publish { it.copy(running = false, message = "Erreur capture : ${t.message}") }
+            stopCapture()
+            return
+        }
+
+        val d = ChestDetector()
+        val openCvOk = d.init()
+        if (openCvOk) d.loadTemplates(templatesDir())
+        detector = d
+
+        machine.reset()
+        frames = 0
+        errors = 0
+        lastProcessAt = 0L
+
+        publish {
+            CaptureStatus(
+                running = true,
+                hasTemplates = d.hasTemplates(),
+                message = when {
+                    !openCvOk -> "OpenCV non initialisé"
+                    !d.hasTemplates() -> "Calibrer les modèles fermé et ouvert"
+                    else -> "Capture démarrée"
+                }
+            )
+        }
+
+        startHud()
+    }
+
+    private fun startHud() {
+        try {
+            if (Settings.canDrawOverlays(this)) {
+                hud = Hud(this).also { it.show() }
+            }
+        } catch (t: Throwable) {
+            hud = null
+        }
+        val dao = AppDb.get(this).chestDao()
+        scope.launch {
+            combine(status, dao.observeTotal()) { s, total -> hudText(s, total) }
+                .distinctUntilChanged()
+                .collect { text -> mainHandler.post { hud?.update(text) } }
+        }
+    }
+
+    private fun hudText(s: CaptureStatus, total: Int): String {
+        val closed = (s.closedScore * 100).toInt()
+        val open = (s.openScore * 100).toInt()
+        return "Coffres $total / ${ChestGoal.TARGET}\n" +
+            "F $closed%  O $open%  ${s.processingMs} ms"
+    }
+
+    // ------------------------------------------------------------------- images
+
+    private fun onFrame(reader: ImageReader) {
+        var image: Image? = null
+        try {
+            val img = reader.acquireLatestImage() ?: return
+            image = img
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastProcessAt < INTERVAL_MS) return
+            lastProcessAt = now
+
+            val bmp = imageToBitmap(img)
+            img.close()
+            image = null
+            try {
+                process(bmp, now)
+            } finally {
+                bmp.recycle()
+            }
+        } catch (t: Throwable) {
+            errors++
+            publish { it.copy(errorCount = errors, message = "Erreur : ${t.message}") }
+        } finally {
+            image?.close()
+        }
+    }
+
+    private fun imageToBitmap(image: Image): Bitmap {
+        val plane = image.planes[0]
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * image.width
+        val padded = Bitmap.createBitmap(
+            image.width + rowPadding / pixelStride,
+            image.height,
+            Bitmap.Config.ARGB_8888
+        )
+        padded.copyPixelsFromBuffer(plane.buffer)
+        if (rowPadding == 0) return padded
+        val cropped = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+        padded.recycle()
+        return cropped
+    }
+
+    private fun process(bmp: Bitmap, now: Long) {
+        val d = detector ?: return
+
+        val p = pending
+        if (p != null) {
+            pending = null
+            saveTemplate(d, p, bmp)
+            return
+        }
+
+        if (!d.hasTemplates()) {
+            publish { it.copy(hasTemplates = false, message = "Calibrer les modèles fermé et ouvert") }
+            return
+        }
+
+        val r = d.detect(bmp)
+        frames++
+        if (r.error != null) {
+            errors++
+            publish {
+                it.copy(
+                    processingMs = r.processingMs,
+                    framesProcessed = frames,
+                    errorCount = errors,
+                    message = r.error
+                )
+            }
+            return
+        }
+
+        val counted = machine.process(Observation(now, r.closedScore, r.openScore))
+        if (counted) {
+            val confidence = machine.lastConfidence
+            scope.launch {
+                try {
+                    AppDb.get(applicationContext).chestDao().insert(
+                        ChestEvent(timestampMs = System.currentTimeMillis(), confidence = confidence)
+                    )
+                } catch (t: Throwable) {
+                    errors++
+                    publish { it.copy(errorCount = errors, message = "Erreur base : ${t.message}") }
+                }
+            }
+        }
+
+        publish {
+            it.copy(
+                closedScore = r.closedScore,
+                openScore = r.openScore,
+                processingMs = r.processingMs,
+                framesProcessed = frames,
+                sessionCount = machine.count,
+                machineState = machine.state.name,
+                hasTemplates = true,
+                lastConfidence = machine.lastConfidence,
+                errorCount = errors,
+                message = if (counted) "Coffre compté" else ""
+            )
+        }
+    }
+
+    // --------------------------------------------------------------- calibration
+
+    private fun queueTemplate(intent: Intent) {
+        if (projection == null) {
+            publish { it.copy(message = "Capture non démarrée") }
+            stopSelf()
+            return
+        }
+        val kind = try {
+            TemplateKind.valueOf(intent.getStringExtra(EXTRA_KIND) ?: "")
+        } catch (t: Throwable) {
+            TemplateKind.CLOSED
+        }
+        pending = PendingTemplate(
+            kind,
+            intent.getFloatExtra(EXTRA_LEFT, 0f),
+            intent.getFloatExtra(EXTRA_TOP, 0f),
+            intent.getFloatExtra(EXTRA_RIGHT, 1f),
+            intent.getFloatExtra(EXTRA_BOTTOM, 1f)
+        )
+        publish { it.copy(message = "Enregistrement du modèle…") }
+    }
+
+    private fun saveTemplate(d: ChestDetector, p: PendingTemplate, bmp: Bitmap) {
+        val x0 = (p.left * bmp.width).toInt().coerceIn(0, bmp.width - 1)
+        val y0 = (p.top * bmp.height).toInt().coerceIn(0, bmp.height - 1)
+        val x1 = (p.right * bmp.width).toInt().coerceIn(x0 + 1, bmp.width)
+        val y1 = (p.bottom * bmp.height).toInt().coerceIn(y0 + 1, bmp.height)
+        if (x1 - x0 < 16 || y1 - y0 < 16) {
+            publish { it.copy(message = "Zone trop petite pour un modèle") }
+            return
+        }
+        val crop = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
+        val ok = d.saveTemplate(templatesDir(), p.kind, crop)
+        crop.recycle()
+        machine.reset()
+        publish {
+            it.copy(
+                hasTemplates = d.hasTemplates(),
+                message = if (ok) "Modèle ${p.kind.name} enregistré" else "Échec d'enregistrement du modèle"
+            )
+        }
+    }
+
+    private fun templatesDir() = File(filesDir, "templates")
+
+    // -------------------------------------------------------------------- arrêt
+
+    private fun stopCapture() {
+        if (stopping) return
+        stopping = true
+        pending = null
+
+        try { virtualDisplay?.release() } catch (t: Throwable) { }
+        virtualDisplay = null
+
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.close()
+        } catch (t: Throwable) { }
+        imageReader = null
+
+        try { projection?.stop() } catch (t: Throwable) { }
+        projection = null
+
+        thread?.quitSafely()
+        thread = null
+
+        detector?.release()
+        detector = null
+
+        try { hud?.hide() } catch (t: Throwable) { }
+        hud = null
+
+        publish { CaptureStatus(running = false, message = "Capture arrêtée") }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (t: Throwable) { }
+        stopSelf()
+    }
+
+    // ------------------------------------------------------------------- outils
+
+    private fun captureSize(): Triple<Int, Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val realW: Int
+        val realH: Int
+        if (Build.VERSION.SDK_INT >= 30) {
+            val b = wm.maximumWindowMetrics.bounds
+            realW = b.width()
+            realH = b.height()
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            realW = dm.widthPixels
+            realH = dm.heightPixels
+        }
+        val scale = min(1f, MAX_CAPTURE_SIDE.toFloat() / max(realW, realH))
+        val w = max(2, ((realW * scale).toInt() / 2) * 2)
+        val h = max(2, ((realH * scale).toInt() / 2) * 2)
+        return Triple(w, h, resources.displayMetrics.densityDpi)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getResultData(intent: Intent): Intent? {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        }
+    }
+
     private fun createChannel() {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
@@ -302,5 +461,70 @@ class CaptureService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
         )
+    }
+
+    private fun buildNotification(): Notification {
+        val stopPi = PendingIntent.getService(
+            this, 1, stopIntent(this),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.notif_title))
+            .setContentText(getString(R.string.notif_text))
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setOngoing(true)
+            .addAction(0, "Arrêter", stopPi)
+            .build()
+    }
+
+    private fun publish(block: (CaptureStatus) -> CaptureStatus) {
+        _status.update(block)
+    }
+
+    companion object {
+        const val ACTION_START = "com.chestcounter.action.START"
+        const val ACTION_STOP = "com.chestcounter.action.STOP"
+        const val ACTION_SAVE_TEMPLATE = "com.chestcounter.action.SAVE_TEMPLATE"
+
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_RESULT_DATA = "result_data"
+        const val EXTRA_KIND = "kind"
+        const val EXTRA_LEFT = "left"
+        const val EXTRA_TOP = "top"
+        const val EXTRA_RIGHT = "right"
+        const val EXTRA_BOTTOM = "bottom"
+
+        private const val CHANNEL_ID = "chestcounter_capture"
+        private const val NOTIF_ID = 1001
+        private const val INTERVAL_MS = 200L
+        private const val MAX_CAPTURE_SIDE = 1280
+
+        private val _status = MutableStateFlow(CaptureStatus())
+        val status: StateFlow<CaptureStatus> = _status.asStateFlow()
+
+        fun startIntent(context: Context, resultCode: Int, data: Intent): Intent =
+            Intent(context, CaptureService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_RESULT_CODE, resultCode)
+                .putExtra(EXTRA_RESULT_DATA, data)
+
+        fun stopIntent(context: Context): Intent =
+            Intent(context, CaptureService::class.java).setAction(ACTION_STOP)
+
+        fun templateIntent(
+            context: Context,
+            kind: TemplateKind,
+            left: Float,
+            top: Float,
+            right: Float,
+            bottom: Float
+        ): Intent =
+            Intent(context, CaptureService::class.java)
+                .setAction(ACTION_SAVE_TEMPLATE)
+                .putExtra(EXTRA_KIND, kind.name)
+                .putExtra(EXTRA_LEFT, left)
+                .putExtra(EXTRA_TOP, top)
+                .putExtra(EXTRA_RIGHT, right)
+                .putExtra(EXTRA_BOTTOM, bottom)
     }
 }
