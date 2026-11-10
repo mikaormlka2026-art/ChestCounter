@@ -1,107 +1,181 @@
 package com.chestcounter.detect
 
-import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.Mat
-import org.opencv.core.Rect
 import org.opencv.core.Size
-import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import java.io.FileOutputStream
+import kotlin.math.min
+import kotlin.math.roundToInt
 
-class ChestDetector(private val context: Context) {
+enum class TemplateKind(val fileName: String) {
+    CLOSED("closed.png"),
+    OPEN("open.png")
+}
 
-    companion object {
-        private const val SCALE = 0.5
-        private const val FILE_CLOSED = "tpl_closed.png"
-        private const val FILE_OPEN = "tpl_open.png"
-    }
+data class DetectionResult(
+    val closedScore: Float,
+    val openScore: Float,
+    val processingMs: Long,
+    val error: String? = null
+)
 
-    /** Seuil de ressemblance (0 à 1). Plus haut = plus strict. */
-    var threshold = 0.80
+/**
+ * Détection par modèles (template matching OpenCV).
+ * Les modèles "coffre fermé" et "coffre ouvert" sont calibrés par l'utilisateur
+ * depuis une vraie capture. La recherche se fait à plusieurs échelles.
+ * Le bitmap reçu doit être en ARGB_8888.
+ */
+class ChestDetector(
+    private val targetWidth: Int = 480,
+    private val scales: DoubleArray = doubleArrayOf(0.8, 1.0, 1.25)
+) {
+    private var ready = false
+    private var closedGray: Mat? = null
+    private var openGray: Mat? = null
 
-    private var closedTpl: Mat? = null
-    private var openTpl: Mat? = null
-
-    val ready: Boolean get() = closedTpl != null && openTpl != null
-
+    @Synchronized
     fun init(): Boolean {
-        val ok = OpenCVLoader.initLocal()
-        if (ok) loadTemplates()
-        return ok
+        ready = try {
+            OpenCVLoader.initLocal()
+        } catch (t: Throwable) {
+            false
+        }
+        return ready
     }
 
-    private fun file(name: String) = File(context.filesDir, name)
+    @Synchronized
+    fun hasTemplates(): Boolean = closedGray != null && openGray != null
 
-    private fun loadTemplates() {
-        closedTpl = load(FILE_CLOSED)
-        openTpl = load(FILE_OPEN)
+    @Synchronized
+    fun setTemplate(kind: TemplateKind, bitmap: Bitmap) {
+        val gray = bitmapToGray(bitmap)
+        when (kind) {
+            TemplateKind.CLOSED -> {
+                closedGray?.release()
+                closedGray = gray
+            }
+            TemplateKind.OPEN -> {
+                openGray?.release()
+                openGray = gray
+            }
+        }
     }
 
-    private fun load(name: String): Mat? {
-        val f = file(name)
-        if (!f.exists()) return null
-        val m = Imgcodecs.imread(f.absolutePath, Imgcodecs.IMREAD_GRAYSCALE)
-        return if (m.empty()) null else m
+    fun saveTemplate(dir: File, kind: TemplateKind, bitmap: Bitmap): Boolean {
+        return try {
+            dir.mkdirs()
+            FileOutputStream(File(dir, kind.fileName)).use {
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+            }
+            setTemplate(kind, bitmap)
+            true
+        } catch (t: Throwable) {
+            false
+        }
     }
 
-    private fun toGraySmall(bmp: Bitmap): Mat {
+    /** Charge les modèles enregistrés. Retourne true si les deux sont chargés. */
+    fun loadTemplates(dir: File): Boolean {
+        for (kind in TemplateKind.values()) {
+            val f = File(dir, kind.fileName)
+            if (!f.exists()) continue
+            val bmp = BitmapFactory.decodeFile(f.absolutePath) ?: continue
+            val argb = if (bmp.config == Bitmap.Config.ARGB_8888) bmp
+            else bmp.copy(Bitmap.Config.ARGB_8888, false)
+            if (argb != null) setTemplate(kind, argb)
+        }
+        return hasTemplates()
+    }
+
+    @Synchronized
+    fun detect(frame: Bitmap): DetectionResult {
+        val start = System.nanoTime()
+        fun elapsed() = (System.nanoTime() - start) / 1_000_000L
+
+        if (!ready) return DetectionResult(0f, 0f, elapsed(), "OpenCV non initialisé")
+        val c = closedGray
+        val o = openGray
+        if (c == null && o == null) {
+            return DetectionResult(0f, 0f, elapsed(), "Aucun modèle calibré")
+        }
+
+        var rgba: Mat? = null
+        var gray: Mat? = null
+        var small: Mat? = null
+        return try {
+            rgba = Mat()
+            Utils.bitmapToMat(frame, rgba)
+            gray = Mat()
+            Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+
+            val factor = min(1.0, targetWidth.toDouble() / gray.cols())
+            small = if (factor < 1.0) {
+                val m = Mat()
+                Imgproc.resize(
+                    gray, m,
+                    Size(gray.cols() * factor, gray.rows() * factor),
+                    0.0, 0.0, Imgproc.INTER_AREA
+                )
+                m
+            } else gray
+
+            val closed = if (c != null) bestScore(small, c, factor) else 0f
+            val open = if (o != null) bestScore(small, o, factor) else 0f
+            DetectionResult(closed, open, elapsed())
+        } catch (t: Throwable) {
+            DetectionResult(0f, 0f, elapsed(), "Erreur détection : ${t.message}")
+        } finally {
+            if (small != null && small !== gray) small.release()
+            gray?.release()
+            rgba?.release()
+        }
+    }
+
+    @Synchronized
+    fun release() {
+        closedGray?.release()
+        openGray?.release()
+        closedGray = null
+        openGray = null
+    }
+
+    private fun bitmapToGray(b: Bitmap): Mat {
         val rgba = Mat()
-        Utils.bitmapToMat(bmp, rgba)
+        Utils.bitmapToMat(b, rgba)
         val gray = Mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
-        val small = Mat()
-        Imgproc.resize(gray, small, Size(), SCALE, SCALE, Imgproc.INTER_AREA)
         rgba.release()
-        gray.release()
-        return small
+        return gray
     }
 
-    /** Calibration : découpe la zone (x, y, w, h en pixels de l'écran) et l'enregistre. */
-    fun saveTemplate(frame: Bitmap, x: Int, y: Int, w: Int, h: Int, isOpen: Boolean): Boolean {
-        val small = toGraySmall(frame)
-        val rx = (x * SCALE).toInt().coerceIn(0, small.cols() - 1)
-        val ry = (y * SCALE).toInt().coerceIn(0, small.rows() - 1)
-        val rw = (w * SCALE).toInt().coerceIn(1, small.cols() - rx)
-        val rh = (h * SCALE).toInt().coerceIn(1, small.rows() - ry)
-        val crop = Mat(small, Rect(rx, ry, rw, rh))
-        val name = if (isOpen) FILE_OPEN else FILE_CLOSED
-        val ok = Imgcodecs.imwrite(file(name).absolutePath, crop)
-        small.release()
-        loadTemplates()
-        return ok
-    }
-
-    fun clearTemplates() {
-        file(FILE_CLOSED).delete()
-        file(FILE_OPEN).delete()
-        closedTpl = null
-        openTpl = null
-    }
-
-    private fun score(img: Mat, tpl: Mat): Double {
-        if (tpl.cols() > img.cols() || tpl.rows() > img.rows()) return 0.0
-        val res = Mat()
-        Imgproc.matchTemplate(img, tpl, res, Imgproc.TM_CCOEFF_NORMED)
-        val v = Core.minMaxLoc(res).maxVal
-        res.release()
-        return if (v.isNaN() || v.isInfinite()) 0.0 else v
-    }
-
-    fun analyze(frame: Bitmap): Observation {
-        val closed = closedTpl ?: return Observation.NONE
-        val open = openTpl ?: return Observation.NONE
-        val img = toGraySmall(frame)
-        val sClosed = score(img, closed)
-        val sOpen = score(img, open)
-        img.release()
-        return when {
-            sOpen >= threshold && sOpen > sClosed -> Observation.OPEN
-            sClosed >= threshold -> Observation.CLOSED
-            else -> Observation.NONE
+    private fun bestScore(frame: Mat, template: Mat, factor: Double): Float {
+        var best = 0f
+        for (s in scales) {
+            val k = factor * s
+            val w = (template.cols() * k).roundToInt()
+            val h = (template.rows() * k).roundToInt()
+            if (w < 8 || h < 8 || w > frame.cols() || h > frame.rows()) continue
+            val t = Mat()
+            val res = Mat()
+            try {
+                Imgproc.resize(
+                    template, t, Size(w.toDouble(), h.toDouble()),
+                    0.0, 0.0, Imgproc.INTER_AREA
+                )
+                Imgproc.matchTemplate(frame, t, res, Imgproc.TM_CCOEFF_NORMED)
+                val v = Core.minMaxLoc(res).maxVal.toFloat()
+                if (!v.isNaN() && v > best) best = v
+            } finally {
+                t.release()
+                res.release()
+            }
         }
+        return best.coerceIn(0f, 1f)
     }
 }
