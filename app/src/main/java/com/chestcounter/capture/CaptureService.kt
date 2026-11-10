@@ -29,6 +29,7 @@ import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.chestcounter.R
 import com.chestcounter.data.AppDb
+import com.chestcounter.data.CaptureCollector
 import com.chestcounter.data.ChestEvent
 import com.chestcounter.data.ChestGoal
 import com.chestcounter.detect.ChestDetector
@@ -63,7 +64,9 @@ data class CaptureStatus(
     val hasTemplates: Boolean = false,
     val lastConfidence: Float = 0f,
     val errorCount: Int = 0,
-    val message: String = ""
+    val message: String = "",
+    val savedCaptures: Int = 0,
+    val collectorError: String = ""
 )
 
 class CaptureService : Service() {
@@ -81,6 +84,7 @@ class CaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var thread: HandlerThread? = null
     private var detector: ChestDetector? = null
+    private var collector: CaptureCollector? = null
     private var hud: Hud? = null
     private val machine = ChestStateMachine()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -190,6 +194,8 @@ class CaptureService : Service() {
         val openCvOk = d.init()
         if (openCvOk) d.loadTemplates(templatesDir())
         detector = d
+
+        collector = CaptureCollector(applicationContext)
 
         machine.reset()
         frames = 0
@@ -323,6 +329,16 @@ class CaptureService : Service() {
             }
         }
 
+        // Collecte facultative de captures (désactivée par défaut).
+        val col = collector
+        try {
+            col?.maybeSave(bmp, now, r.closedScore, r.openScore, counted)
+        } catch (t: Throwable) {
+            // La collecte ne doit jamais perturber la détection.
+        }
+        val savedCount = col?.savedCount ?: 0
+        val colError = col?.lastError ?: ""
+
         publish {
             it.copy(
                 closedScore = r.closedScore,
@@ -334,7 +350,9 @@ class CaptureService : Service() {
                 hasTemplates = true,
                 lastConfidence = machine.lastConfidence,
                 errorCount = errors,
-                message = if (counted) "Coffre compté" else ""
+                message = if (counted) "Coffre compté" else "",
+                savedCaptures = savedCount,
+                collectorError = colError
             )
         }
     }
@@ -409,6 +427,8 @@ class CaptureService : Service() {
 
         detector?.release()
         detector = null
+
+        collector = null
 
         try { hud?.hide() } catch (t: Throwable) { }
         hud = null
