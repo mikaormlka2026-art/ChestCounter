@@ -1,152 +1,131 @@
-package com.chestcounter
+package com.chestcounter.detect
 
-import com.chestcounter.detect.ChestState
-import com.chestcounter.detect.ChestStateMachine
-import com.chestcounter.detect.Observation
-import org.junit.Assert.assertEquals
-import org.junit.Test
+enum class ChestState { IDLE, CLOSED_SEEN, COOLDOWN }
 
-class ChestStateMachineTest {
+data class Observation(
+    val timeMs: Long,
+    val closedScore: Float,
+    val openScore: Float
+)
 
-    /** Envoie une image toutes les `step` ms, de `from` à `to` inclus. Retourne le nombre de coffres comptés. */
-    private fun feed(
-        m: ChestStateMachine,
-        from: Long,
-        to: Long,
-        closed: Float,
-        open: Float,
-        step: Long = 100L
-    ): Int {
-        var counted = 0
-        var t = from
-        while (t <= to) {
-            if (m.process(Observation(t, closed, open))) counted++
-            t += step
+data class StateConfig(
+    val closedThreshold: Float = 0.70f,
+    val openThreshold: Float = 0.70f,
+    val closedStableMs: Long = 300L,
+    val openStableMs: Long = 300L,
+    val maxClosedToOpenMs: Long = 4000L,
+    val cooldownMs: Long = 5000L,
+    val rearmGapMs: Long = 1500L,
+    val gapToleranceMs: Long = 250L
+)
+
+/**
+ * Machine à états sans dépendance Android (donc testable).
+ * Un coffre est compté seulement si : "fermé" stable, puis "ouvert" stable
+ * dans un délai court. Ensuite : pause, puis réarmement uniquement
+ * quand ni fermé ni ouvert n'est visible pendant un moment.
+ */
+class ChestStateMachine(private val cfg: StateConfig = StateConfig()) {
+
+    var state: ChestState = ChestState.IDLE
+        private set
+    var count: Int = 0
+        private set
+    var lastConfidence: Float = 0f
+        private set
+
+    private val closedStreak = Streak(cfg.gapToleranceMs)
+    private val openStreak = Streak(cfg.gapToleranceMs)
+    private var lastClosedAt = -1L
+    private var closedPeak = 0f
+    private var cooldownUntil = 0L
+    private var noneSince = -1L
+
+    /** Retourne true uniquement au moment où un nouveau coffre est compté. */
+    fun process(o: Observation): Boolean {
+        val t = o.timeMs
+        val closedNow = o.closedScore >= cfg.closedThreshold && o.closedScore > o.openScore
+        val openNow = o.openScore >= cfg.openThreshold && o.openScore > o.closedScore
+
+        val closedDur = closedStreak.update(closedNow, t)
+        val openDur = openStreak.update(openNow, t)
+
+        when (state) {
+            ChestState.IDLE -> {
+                if (closedDur >= cfg.closedStableMs) {
+                    state = ChestState.CLOSED_SEEN
+                    lastClosedAt = t
+                    closedPeak = o.closedScore
+                }
+            }
+
+            ChestState.CLOSED_SEEN -> {
+                if (closedNow) {
+                    lastClosedAt = t
+                    if (o.closedScore > closedPeak) closedPeak = o.closedScore
+                }
+                if (openDur >= cfg.openStableMs && t - lastClosedAt <= cfg.maxClosedToOpenMs) {
+                    count++
+                    lastConfidence = (closedPeak + o.openScore) / 2f
+                    state = ChestState.COOLDOWN
+                    cooldownUntil = t + cfg.cooldownMs
+                    noneSince = -1L
+                    closedStreak.reset()
+                    openStreak.reset()
+                    return true
+                } else if (t - lastClosedAt > cfg.maxClosedToOpenMs) {
+                    state = ChestState.IDLE
+                    closedStreak.reset()
+                }
+            }
+
+            ChestState.COOLDOWN -> {
+                if (t >= cooldownUntil) {
+                    if (!closedNow && !openNow) {
+                        if (noneSince < 0) noneSince = t
+                        if (t - noneSince >= cfg.rearmGapMs) {
+                            state = ChestState.IDLE
+                            closedStreak.reset()
+                            openStreak.reset()
+                        }
+                    } else {
+                        noneSince = -1L
+                    }
+                }
+            }
         }
-        return counted
+        return false
     }
 
-    @Test
-    fun ferme_puis_ouvert_compte_un_coffre() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 300, 0.9f, 0f) + feed(m, 400, 700, 0f, 0.9f)
-        assertEquals(1, c)
-        assertEquals(1, m.count)
-        assertEquals(ChestState.COOLDOWN, m.state)
+    fun reset() {
+        state = ChestState.IDLE
+        count = 0
+        lastConfidence = 0f
+        lastClosedAt = -1L
+        closedPeak = 0f
+        cooldownUntil = 0L
+        noneSince = -1L
+        closedStreak.reset()
+        openStreak.reset()
     }
 
-    @Test
-    fun ferme_seul_ne_compte_pas() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 3000, 0.9f, 0f)
-        assertEquals(0, c)
-        assertEquals(0, m.count)
-        assertEquals(ChestState.CLOSED_SEEN, m.state)
-    }
+    private class Streak(private val toleranceMs: Long) {
+        private var start = -1L
+        private var lastHit = -1L
 
-    @Test
-    fun ouvert_seul_sans_ferme_ne_compte_pas() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 3000, 0f, 0.9f)
-        assertEquals(0, c)
-        assertEquals(ChestState.IDLE, m.state)
-    }
+        fun update(hit: Boolean, t: Long): Long {
+            if (hit) {
+                if (start < 0 || t - lastHit > toleranceMs) start = t
+                lastHit = t
+                return t - start
+            }
+            if (start >= 0 && t - lastHit > toleranceMs) start = -1L
+            return if (start >= 0) lastHit - start else 0L
+        }
 
-    @Test
-    fun apparition_trop_breve_du_ferme_est_ignoree() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 200, 0.9f, 0f) + feed(m, 300, 1500, 0f, 0.9f)
-        assertEquals(0, c)
-        assertEquals(ChestState.IDLE, m.state)
-    }
-
-    @Test
-    fun delai_trop_long_entre_ferme_et_ouvert_ne_compte_pas() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 5000, 0f, 0f)
-        assertEquals(ChestState.IDLE, m.state)
-        val c = feed(m, 5100, 5500, 0f, 0.9f)
-        assertEquals(0, c)
-        assertEquals(0, m.count)
-    }
-
-    @Test
-    fun ouvert_qui_reste_affiche_ne_recompte_pas() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 700, 0f, 0.9f)
-        val more = feed(m, 800, 20000, 0f, 0.9f)
-        assertEquals(0, more)
-        assertEquals(1, m.count)
-        assertEquals(ChestState.COOLDOWN, m.state)
-    }
-
-    @Test
-    fun pas_de_recomptage_tant_que_ouvert_reste_visible() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 700, 0f, 0.9f)
-        feed(m, 800, 20000, 0f, 0.9f)
-        val c = feed(m, 20100, 20400, 0.9f, 0f) + feed(m, 20500, 20800, 0f, 0.9f)
-        assertEquals(0, c)
-        assertEquals(1, m.count)
-    }
-
-    @Test
-    fun deuxieme_coffre_compte_apres_rearmement() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 700, 0f, 0.9f)
-        assertEquals(1, m.count)
-        feed(m, 800, 7400, 0f, 0f)
-        assertEquals(ChestState.IDLE, m.state)
-        val c = feed(m, 7500, 7800, 0.9f, 0f) + feed(m, 7900, 8200, 0f, 0.9f)
-        assertEquals(1, c)
-        assertEquals(2, m.count)
-    }
-
-    @Test
-    fun une_image_manquante_est_tolere() {
-        val m = ChestStateMachine()
-        feed(m, 0, 100, 0.9f, 0f)
-        m.process(Observation(200, 0f, 0f))
-        m.process(Observation(300, 0.9f, 0f))
-        assertEquals(ChestState.CLOSED_SEEN, m.state)
-    }
-
-    @Test
-    fun scores_ambigus_ne_declenchent_rien() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 3000, 0.9f, 0.9f)
-        assertEquals(0, c)
-        assertEquals(ChestState.IDLE, m.state)
-    }
-
-    @Test
-    fun scores_sous_le_seuil_ne_declenchent_rien() {
-        val m = ChestStateMachine()
-        val c = feed(m, 0, 1000, 0.5f, 0f) + feed(m, 1100, 2000, 0f, 0.5f)
-        assertEquals(0, c)
-        assertEquals(ChestState.IDLE, m.state)
-    }
-
-    @Test
-    fun confiance_est_la_moyenne_des_deux_scores() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 700, 0f, 0.8f)
-        assertEquals(0.85f, m.lastConfidence, 0.001f)
-    }
-
-    @Test
-    fun reset_remet_tout_a_zero() {
-        val m = ChestStateMachine()
-        feed(m, 0, 300, 0.9f, 0f)
-        feed(m, 400, 700, 0f, 0.9f)
-        m.reset()
-        assertEquals(0, m.count)
-        assertEquals(0f, m.lastConfidence, 0.0001f)
-        assertEquals(ChestState.IDLE, m.state)
+        fun reset() {
+            start = -1L
+            lastHit = -1L
+        }
     }
 }
