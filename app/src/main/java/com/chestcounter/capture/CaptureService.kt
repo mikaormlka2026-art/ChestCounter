@@ -52,7 +52,6 @@ import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 
-/** État visible par l'écran principal et le HUD (diagnostic). */
 data class CaptureStatus(
     val running: Boolean = false,
     val closedScore: Float = 0f,
@@ -85,6 +84,7 @@ class CaptureService : Service() {
     private var thread: HandlerThread? = null
     private var detector: ChestDetector? = null
     private var collector: CaptureCollector? = null
+    private var framePool: FramePool? = null
     private var hud: Hud? = null
     private val machine = ChestStateMachine()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -116,8 +116,6 @@ class CaptureService : Service() {
         scope.cancel()
         super.onDestroy()
     }
-
-    // ---------------------------------------------------------------- démarrage
 
     private fun startCapture(intent: Intent) {
         if (projection != null) return
@@ -166,7 +164,6 @@ class CaptureService : Service() {
         thread = ht
         val bg = Handler(ht.looper)
 
-        // Obligatoire sur Android 14+ : callback enregistré avant le VirtualDisplay.
         mp.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 mainHandler.post { stopCapture() }
@@ -196,6 +193,7 @@ class CaptureService : Service() {
         detector = d
 
         collector = CaptureCollector(applicationContext)
+        framePool = FramePool()
 
         machine.reset()
         frames = 0
@@ -240,8 +238,6 @@ class CaptureService : Service() {
             "F $closed%  O $open%  ${s.processingMs} ms"
     }
 
-    // ------------------------------------------------------------------- images
-
     private fun onFrame(reader: ImageReader) {
         var image: Image? = null
         try {
@@ -251,37 +247,17 @@ class CaptureService : Service() {
             if (now - lastProcessAt < INTERVAL_MS) return
             lastProcessAt = now
 
-            val bmp = imageToBitmap(img)
+            val pool = framePool ?: return
+            val bmp = pool.fill(img)
             img.close()
             image = null
-            try {
-                process(bmp, now)
-            } finally {
-                bmp.recycle()
-            }
+            process(bmp, now)
         } catch (t: Throwable) {
             errors++
             publish { it.copy(errorCount = errors, message = "Erreur : ${t.message}") }
         } finally {
             image?.close()
         }
-    }
-
-    private fun imageToBitmap(image: Image): Bitmap {
-        val plane = image.planes[0]
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-        val padded = Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        padded.copyPixelsFromBuffer(plane.buffer)
-        if (rowPadding == 0) return padded
-        val cropped = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
-        padded.recycle()
-        return cropped
     }
 
     private fun process(bmp: Bitmap, now: Long) {
@@ -329,12 +305,10 @@ class CaptureService : Service() {
             }
         }
 
-        // Collecte facultative de captures (désactivée par défaut).
         val col = collector
         try {
             col?.maybeSave(bmp, now, r.closedScore, r.openScore, counted)
         } catch (t: Throwable) {
-            // La collecte ne doit jamais perturber la détection.
         }
         val savedCount = col?.savedCount ?: 0
         val colError = col?.lastError ?: ""
@@ -356,8 +330,6 @@ class CaptureService : Service() {
             )
         }
     }
-
-    // --------------------------------------------------------------- calibration
 
     private fun queueTemplate(intent: Intent) {
         if (projection == null) {
@@ -403,8 +375,6 @@ class CaptureService : Service() {
 
     private fun templatesDir() = File(filesDir, "templates")
 
-    // -------------------------------------------------------------------- arrêt
-
     private fun stopCapture() {
         if (stopping) return
         stopping = true
@@ -428,6 +398,9 @@ class CaptureService : Service() {
         detector?.release()
         detector = null
 
+        framePool?.release()
+        framePool = null
+
         collector = null
 
         try { hud?.hide() } catch (t: Throwable) { }
@@ -439,8 +412,6 @@ class CaptureService : Service() {
         } catch (t: Throwable) { }
         stopSelf()
     }
-
-    // ------------------------------------------------------------------- outils
 
     private fun captureSize(): Triple<Int, Int, Int> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
