@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Chest Counter</string>
-    <string name="notif_channel">Capture d\'écran</string>
-    <string name="notif_title">Chest Counter actif</string>
+    <string name="notif_channel">Capture en cours</string>
+    <string name="notif_title">Chest Counter</string>
     <string name="notif_text">Comptage des coffres en cours</string>
 </resources>
