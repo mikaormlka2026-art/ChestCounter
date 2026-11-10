@@ -7,9 +7,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:allowBackup="false"
+        android:allowBackup="true"
         android:label="@string/app_name"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity
             android:name=".ui.MainActivity"
@@ -26,4 +26,5 @@
             android:foregroundServiceType="mediaProjection" />
 
     </application>
+
 </manifest>
