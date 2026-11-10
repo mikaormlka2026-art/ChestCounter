@@ -6,38 +6,42 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.Mat
+import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class TemplateKind(val fileName: String) {
-    CLOSED("closed.png"),
-    OPEN("open.png")
+enum class TemplateKind(val fileName: String, val detectionKind: DetectionKind) {
+    CLOSED("closed.png", DetectionKind.CLOSED),
+    OPEN("open.png", DetectionKind.OPEN)
 }
 
-data class DetectionResult(
-    val closedScore: Float,
-    val openScore: Float,
-    val processingMs: Long,
-    val error: String? = null
-)
+private class ScaledTemplates(val factor: Double, val mats: List<Mat>) {
+    fun release() {
+        mats.forEach { it.release() }
+    }
+}
 
-/**
- * Détection par modèles (template matching OpenCV).
- * Les modèles "coffre fermé" et "coffre ouvert" sont calibrés par l'utilisateur
- * depuis une vraie capture. La recherche se fait à plusieurs échelles.
- * Le bitmap reçu doit être en ARGB_8888.
- */
+private class MatchOutcome(val best: Float, val detections: List<Detection>)
+
 class ChestDetector(
     private val targetWidth: Int = 480,
-    private val scales: DoubleArray = doubleArrayOf(0.8, 1.0, 1.25)
+    private val scales: DoubleArray = doubleArrayOf(0.8, 1.0, 1.25),
+    private val listThreshold: Float = 0.5f,
+    private val maxPerKind: Int = 8
 ) {
     private var ready = false
     private var closedGray: Mat? = null
     private var openGray: Mat? = null
+    private var closedScaled: ScaledTemplates? = null
+    private var openScaled: ScaledTemplates? = null
+    private var rgbaBuf: Mat? = null
+    private var grayBuf: Mat? = null
+    private var smallBuf: Mat? = null
 
     @Synchronized
     fun init(): Boolean {
@@ -45,6 +49,11 @@ class ChestDetector(
             OpenCVLoader.initLocal()
         } catch (t: Throwable) {
             false
+        }
+        if (ready && rgbaBuf == null) {
+            rgbaBuf = Mat()
+            grayBuf = Mat()
+            smallBuf = Mat()
         }
         return ready
     }
@@ -59,10 +68,14 @@ class ChestDetector(
             TemplateKind.CLOSED -> {
                 closedGray?.release()
                 closedGray = gray
+                closedScaled?.release()
+                closedScaled = null
             }
             TemplateKind.OPEN -> {
                 openGray?.release()
                 openGray = gray
+                openScaled?.release()
+                openScaled = null
             }
         }
     }
@@ -80,7 +93,6 @@ class ChestDetector(
         }
     }
 
-    /** Charge les modèles enregistrés. Retourne true si les deux sont chargés. */
     fun loadTemplates(dir: File): Boolean {
         for (kind in TemplateKind.values()) {
             val f = File(dir, kind.fileName)
@@ -104,36 +116,58 @@ class ChestDetector(
         if (c == null && o == null) {
             return DetectionResult(0f, 0f, elapsed(), "Aucun modèle calibré")
         }
+        val rgba = rgbaBuf
+        val gray = grayBuf
+        val small = smallBuf
+        if (rgba == null || gray == null || small == null) {
+            return DetectionResult(0f, 0f, elapsed(), "Tampons OpenCV absents")
+        }
 
-        var rgba: Mat? = null
-        var gray: Mat? = null
-        var small: Mat? = null
         return try {
-            rgba = Mat()
             Utils.bitmapToMat(frame, rgba)
-            gray = Mat()
             Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
 
             val factor = min(1.0, targetWidth.toDouble() / gray.cols())
-            small = if (factor < 1.0) {
-                val m = Mat()
+            val src: Mat = if (factor < 1.0) {
                 Imgproc.resize(
-                    gray, m,
+                    gray, small,
                     Size(gray.cols() * factor, gray.rows() * factor),
                     0.0, 0.0, Imgproc.INTER_AREA
                 )
-                m
+                small
             } else gray
 
-            val closed = if (c != null) bestScore(small, c, factor) else 0f
-            val open = if (o != null) bestScore(small, o, factor) else 0f
-            DetectionResult(closed, open, elapsed())
+            val all = ArrayList<Detection>()
+            var closedBest = 0f
+            var openBest = 0f
+
+            if (c != null) {
+                val r = match(
+                    src,
+                    ensureScaled(TemplateKind.CLOSED, c, factor),
+                    factor,
+                    DetectionKind.CLOSED
+                )
+                closedBest = r.best
+                all.addAll(r.detections)
+            }
+            if (o != null) {
+                val r = match(
+                    src,
+                    ensureScaled(TemplateKind.OPEN, o, factor),
+                    factor,
+                    DetectionKind.OPEN
+                )
+                openBest = r.best
+                all.addAll(r.detections)
+            }
+
+            DetectionResult(
+                closedBest, openBest, elapsed(), null,
+                all, frame.width, frame.height
+            )
         } catch (t: Throwable) {
             DetectionResult(0f, 0f, elapsed(), "Erreur détection : ${t.message}")
-        } finally {
-            if (small != null && small !== gray) small.release()
-            gray?.release()
-            rgba?.release()
         }
     }
 
@@ -141,8 +175,19 @@ class ChestDetector(
     fun release() {
         closedGray?.release()
         openGray?.release()
+        closedScaled?.release()
+        openScaled?.release()
+        rgbaBuf?.release()
+        grayBuf?.release()
+        smallBuf?.release()
         closedGray = null
         openGray = null
+        closedScaled = null
+        openScaled = null
+        rgbaBuf = null
+        grayBuf = null
+        smallBuf = null
+        ready = false
     }
 
     private fun bitmapToGray(b: Bitmap): Mat {
@@ -154,28 +199,99 @@ class ChestDetector(
         return gray
     }
 
-    private fun bestScore(frame: Mat, template: Mat, factor: Double): Float {
-        var best = 0f
+    private fun ensureScaled(kind: TemplateKind, template: Mat, factor: Double): ScaledTemplates {
+        val current = if (kind == TemplateKind.CLOSED) closedScaled else openScaled
+        if (current != null && current.factor == factor) return current
+        current?.release()
+        val built = buildScaled(template, factor)
+        if (kind == TemplateKind.CLOSED) closedScaled = built else openScaled = built
+        return built
+    }
+
+    private fun buildScaled(template: Mat, factor: Double): ScaledTemplates {
+        val mats = ArrayList<Mat>()
         for (s in scales) {
             val k = factor * s
             val w = (template.cols() * k).roundToInt()
             val h = (template.rows() * k).roundToInt()
-            if (w < 8 || h < 8 || w > frame.cols() || h > frame.rows()) continue
+            if (w < 8 || h < 8) continue
             val t = Mat()
+            Imgproc.resize(
+                template, t, Size(w.toDouble(), h.toDouble()),
+                0.0, 0.0, Imgproc.INTER_AREA
+            )
+            mats.add(t)
+        }
+        return ScaledTemplates(factor, mats)
+    }
+
+    private fun match(
+        src: Mat,
+        scaled: ScaledTemplates,
+        factor: Double,
+        kind: DetectionKind
+    ): MatchOutcome {
+        var best = 0f
+        val candidates = ArrayList<Detection>()
+        for (t in scaled.mats) {
+            if (t.cols() > src.cols() || t.rows() > src.rows()) continue
             val res = Mat()
             try {
-                Imgproc.resize(
-                    template, t, Size(w.toDouble(), h.toDouble()),
-                    0.0, 0.0, Imgproc.INTER_AREA
-                )
-                Imgproc.matchTemplate(frame, t, res, Imgproc.TM_CCOEFF_NORMED)
-                val v = Core.minMaxLoc(res).maxVal.toFloat()
-                if (!v.isNaN() && v > best) best = v
+                Imgproc.matchTemplate(src, t, res, Imgproc.TM_CCOEFF_NORMED)
+                val top = extractPeaks(res, t.cols(), t.rows(), factor, kind, candidates)
+                if (top > best) best = top
             } finally {
-                t.release()
                 res.release()
             }
         }
-        return best.coerceIn(0f, 1f)
+        return MatchOutcome(
+            best.coerceIn(0f, 1f),
+            nonMaxSuppression(candidates, 0.4f, maxPerKind)
+        )
+    }
+
+    private fun extractPeaks(
+        res: Mat,
+        tw: Int,
+        th: Int,
+        factor: Double,
+        kind: DetectionKind,
+        out: MutableList<Detection>
+    ): Float {
+        var first = 0f
+        var n = 0
+        while (n < maxPerKind) {
+            val mm = Core.minMaxLoc(res)
+            val v = mm.maxVal.toFloat()
+            if (v.isNaN()) break
+            if (n == 0) first = v
+            if (v < listThreshold) break
+
+            val x = mm.maxLoc.x
+            val y = mm.maxLoc.y
+            out.add(
+                Detection(
+                    kind,
+                    BoundingBox.fromSize(
+                        (x / factor).toFloat(),
+                        (y / factor).toFloat(),
+                        (tw / factor).toFloat(),
+                        (th / factor).toFloat()
+                    ),
+                    v.coerceIn(0f, 1f)
+                )
+            )
+
+            val x0 = max(0, (x - tw / 2).toInt())
+            val y0 = max(0, (y - th / 2).toInt())
+            val x1 = min(res.cols(), (x + tw / 2).toInt() + 1)
+            val y1 = min(res.rows(), (y + th / 2).toInt() + 1)
+            if (x1 <= x0 || y1 <= y0) break
+            val sub = res.submat(y0, y1, x0, x1)
+            sub.setTo(Scalar(-1.0))
+            sub.release()
+            n++
+        }
+        return first
     }
 }
