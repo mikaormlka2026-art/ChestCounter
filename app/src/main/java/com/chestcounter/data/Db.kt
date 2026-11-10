@@ -11,30 +11,39 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
 
-const val GOAL = 1000
+object ChestGoal {
+    const val TARGET = 1000
+}
 
 @Entity(tableName = "chest_events")
 data class ChestEvent(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val timestamp: Long
+    val timestampMs: Long,
+    val confidence: Float
 )
 
 @Dao
 interface ChestDao {
     @Insert
-    suspend fun insert(event: ChestEvent)
+    suspend fun insert(event: ChestEvent): Long
 
     @Query("SELECT COUNT(*) FROM chest_events")
-    fun totalFlow(): Flow<Int>
+    fun observeTotal(): Flow<Int>
 
-    @Query("SELECT COUNT(*) FROM chest_events WHERE timestamp >= :since")
-    fun countSinceFlow(since: Long): Flow<Int>
+    @Query("SELECT COUNT(*) FROM chest_events")
+    suspend fun total(): Int
 
-    @Query("SELECT timestamp FROM chest_events ORDER BY timestamp DESC LIMIT 1")
-    fun lastFlow(): Flow<Long?>
+    @Query("SELECT COUNT(*) FROM chest_events WHERE timestampMs >= :sinceMs")
+    fun observeSince(sinceMs: Long): Flow<Int>
 
-    @Query("DELETE FROM chest_events WHERE id = (SELECT MAX(id) FROM chest_events)")
-    suspend fun deleteLast()
+    @Query("SELECT * FROM chest_events ORDER BY timestampMs DESC LIMIT :limit")
+    fun observeRecent(limit: Int): Flow<List<ChestEvent>>
+
+    @Query(
+        "DELETE FROM chest_events WHERE id = " +
+            "(SELECT id FROM chest_events ORDER BY timestampMs DESC LIMIT 1)"
+    )
+    suspend fun deleteLast(): Int
 
     @Query("DELETE FROM chest_events")
     suspend fun deleteAll()
@@ -42,18 +51,21 @@ interface ChestDao {
 
 @Database(entities = [ChestEvent::class], version = 1, exportSchema = false)
 abstract class AppDb : RoomDatabase() {
-    abstract fun dao(): ChestDao
+
+    abstract fun chestDao(): ChestDao
 
     companion object {
-        @Volatile private var instance: AppDb? = null
+        @Volatile
+        private var instance: AppDb? = null
 
-        fun get(context: Context): AppDb =
-            instance ?: synchronized(this) {
+        fun get(context: Context): AppDb {
+            return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDb::class.java,
                     "chestcounter.db"
                 ).build().also { instance = it }
             }
+        }
     }
 }
