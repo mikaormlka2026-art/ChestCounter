@@ -11,7 +11,11 @@ data class RoiScores(
     val geometryScore: Float?,
     val shapeScore: Float?,
     val processingUs: Long,
-    val error: String? = null
+    val error: String? = null,
+    val hogScore: Float? = null,
+    val orbScore: Float? = null,
+    val orbMatchCount: Int? = null,
+    val geometricConsistency: Float? = null
 ) {
     companion object {
         fun none(processingUs: Long, error: String? = null) =
