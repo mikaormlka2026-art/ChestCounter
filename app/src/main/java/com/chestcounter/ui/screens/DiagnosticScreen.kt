@@ -57,6 +57,33 @@ fun DiagnosticScreen(
             }
         }
 
+        SectionCard("Capture d'écran") {
+            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.s)) {
+                MetricTile("Reçues", "${status.framesReceived}", Modifier.weight(1f))
+                MetricTile("Noires", "${status.blackFrames}", Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(Spacing.m))
+            KeyValue(
+                "Capture",
+                if (status.running) "active" else "arrêtée",
+                valueColor = if (status.running) Palette.Success else Palette.Danger
+            )
+            KeyValue(
+                "Dernière image",
+                when {
+                    status.framesReceived == 0 -> "aucune reçue"
+                    status.lastFrameBlack -> "noire"
+                    else -> "avec du contenu"
+                },
+                valueColor = when {
+                    status.framesReceived == 0 -> Palette.TextPrimary
+                    status.lastFrameBlack -> Palette.Danger
+                    else -> Palette.Success
+                }
+            )
+            KeyValue("Taille", "${status.frameWidth} x ${status.frameHeight}")
+        }
+
         SectionCard("Détection") {
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.s)) {
                 MetricTile(
@@ -73,7 +100,7 @@ fun DiagnosticScreen(
             Spacer(Modifier.height(Spacing.s))
             Row(horizontalArrangement = Arrangement.spacedBy(Spacing.s)) {
                 MetricTile("Traitement", "${status.processingMs} ms", Modifier.weight(1f))
-                MetricTile("Images", "${status.framesProcessed}", Modifier.weight(1f))
+                MetricTile("Analysées", "${status.framesProcessed}", Modifier.weight(1f))
             }
             Spacer(Modifier.height(Spacing.m))
             KeyValue(
