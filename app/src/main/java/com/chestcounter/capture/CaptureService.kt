@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -72,7 +73,10 @@ data class CaptureStatus(
     val collectorError: String = "",
     val tracks: List<Track> = emptyList(),
     val frameWidth: Int = 0,
-    val frameHeight: Int = 0
+    val frameHeight: Int = 0,
+    val framesReceived: Int = 0,
+    val blackFrames: Int = 0,
+    val lastFrameBlack: Boolean = false
 )
 
 class CaptureService : Service() {
@@ -111,6 +115,13 @@ class CaptureService : Service() {
     private var frames = 0
     private var errors = 0
     private var lastPhase = "IDLE"
+
+    private var received = 0
+    private var blackCount = 0
+    private var blackStreak = 0
+
+    @Volatile
+    private var blackWarning = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -187,9 +198,14 @@ class CaptureService : Service() {
 
         mp.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
-                mainHandler.post { stopCapture() }
+                mainHandler.post { stopCapture("Capture arrêtée par Android") }
             }
         }, bg)
+
+        received = 0
+        blackCount = 0
+        blackStreak = 0
+        blackWarning = ""
 
         try {
             val (w, ch, dpi) = captureSize()
@@ -329,6 +345,7 @@ class CaptureService : Service() {
         try {
             val img = reader.acquireLatestImage() ?: return
             image = img
+            received++
             val now = SystemClock.elapsedRealtime()
             if (now - lastProcessAt < INTERVAL_MS) return
             lastProcessAt = now
@@ -337,6 +354,31 @@ class CaptureService : Service() {
             val bmp = pool.fill(img)
             img.close()
             image = null
+
+            val black = isMostlyBlack(bmp)
+            if (black) {
+                blackCount++
+                blackStreak++
+            } else {
+                blackStreak = 0
+            }
+            blackWarning = if (blackStreak >= BLACK_STREAK_WARN) {
+                "Image noire reçue : le flux de GeForce NOW semble protégé, ou la capture ne voit pas le jeu"
+            } else {
+                ""
+            }
+            val rec = received
+            val bc = blackCount
+            publish {
+                it.copy(
+                    framesReceived = rec,
+                    blackFrames = bc,
+                    lastFrameBlack = black,
+                    frameWidth = bmp.width,
+                    frameHeight = bmp.height
+                )
+            }
+
             process(bmp, now)
         } catch (t: Throwable) {
             errors++
@@ -344,6 +386,26 @@ class CaptureService : Service() {
         } finally {
             image?.close()
         }
+    }
+
+    // Regarde une grille de points : si presque tous sont noirs, l'image est considérée noire.
+    private fun isMostlyBlack(bmp: Bitmap): Boolean {
+        val w = bmp.width
+        val h = bmp.height
+        if (w < 2 || h < 2) return false
+        var dark = 0
+        var total = 0
+        for (gy in 0 until GRID_H) {
+            val y = ((gy + 0.5f) * h / GRID_H).toInt().coerceIn(0, h - 1)
+            for (gx in 0 until GRID_W) {
+                val x = ((gx + 0.5f) * w / GRID_W).toInt().coerceIn(0, w - 1)
+                val p = bmp.getPixel(x, y)
+                val m = max(Color.red(p), max(Color.green(p), Color.blue(p)))
+                if (m < DARK_LEVEL) dark++
+                total++
+            }
+        }
+        return total > 0 && dark * 100 >= total * BLACK_PERCENT
     }
 
     private fun process(bmp: Bitmap, now: Long) {
@@ -363,7 +425,13 @@ class CaptureService : Service() {
         }
 
         if (!d.hasTemplates()) {
-            publish { it.copy(hasTemplates = false, message = "Calibrer les modèles fermé et ouvert") }
+            val warn = blackWarning
+            publish {
+                it.copy(
+                    hasTemplates = false,
+                    message = if (warn.isNotEmpty()) warn else "Calibrer les modèles fermé et ouvert"
+                )
+            }
             return
         }
 
@@ -409,6 +477,7 @@ class CaptureService : Service() {
         }
         val savedCount = col?.savedCount ?: 0
         val colError = col?.lastError ?: ""
+        val warn = blackWarning
 
         publish {
             it.copy(
@@ -421,7 +490,7 @@ class CaptureService : Service() {
                 hasTemplates = true,
                 lastConfidence = engine.lastConfidence,
                 errorCount = errors,
-                message = if (counted) "Coffre compté" else "",
+                message = if (counted) "Coffre compté" else warn,
                 savedCaptures = savedCount,
                 collectorError = colError,
                 tracks = out.tracks,
@@ -476,7 +545,7 @@ class CaptureService : Service() {
 
     private fun templatesDir() = File(filesDir, "templates")
 
-    private fun stopCapture() {
+    private fun stopCapture(reason: String = "Capture arrêtée") {
         if (stopping) return
         stopping = true
         pending = null
@@ -514,7 +583,7 @@ class CaptureService : Service() {
         try { overlay?.hide() } catch (t: Throwable) { }
         overlay = null
 
-        publish { CaptureStatus(running = false, message = "Capture arrêtée") }
+        publish { CaptureStatus(running = false, message = reason) }
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (t: Throwable) { }
@@ -605,6 +674,12 @@ class CaptureService : Service() {
         private const val MAX_CAPTURE_SIDE = 1280
         private const val PREFS_NAME = "capture_prefs"
         private const val KEY_DIAGNOSTIC = "diagnostic"
+
+        private const val GRID_W = 24
+        private const val GRID_H = 14
+        private const val DARK_LEVEL = 12
+        private const val BLACK_PERCENT = 98
+        private const val BLACK_STREAK_WARN = 25
 
         private val _status = MutableStateFlow(CaptureStatus())
         val status: StateFlow<CaptureStatus> = _status.asStateFlow()
