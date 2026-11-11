@@ -1,5 +1,7 @@
 package com.chestcounter.ui
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
@@ -14,6 +16,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -40,6 +43,8 @@ import kotlin.math.min
 
 /**
  * Bulle flottante : violet sombre, déplaçable au doigt.
+ * Quand on la lâche, elle glisse toute seule vers le bord gauche ou droit le plus proche,
+ * pour ne pas gêner la vue au milieu du jeu.
  * Un appui simple sur le fond de la bulle la réduit ou la déplie (mode compact).
  * Le bouton « Calibrer » ouvre le réglage de la zone, un cadre par-dessus le jeu,
  * et les boutons « Modèle fermé » / « Modèle ouvert » (enregistrement immédiat).
@@ -68,6 +73,7 @@ class Hud(private val context: Context) {
     private var calibToggle: TextView? = null
     private var bar: SoftProgress? = null
     private var barAnim: ValueAnimator? = null
+    private var snapAnim: ValueAnimator? = null
     private var lastCount = -1
     private var compact = false
     private var calibOpen = false
@@ -275,6 +281,9 @@ class Hud(private val context: Context) {
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         startStatusWatcher()
 
+        // Une fois la bulle mesurée, on la recolle au bord (utile si l'écran a tourné).
+        card.post { snapToEdge(false) }
+
         // Entrée en douceur
         card.translationY = -dp(6).toFloat()
         card.animate()
@@ -321,6 +330,8 @@ class Hud(private val context: Context) {
         scope = null
         handler.removeCallbacksAndMessages(null)
         hideFrame()
+        snapAnim?.cancel()
+        snapAnim = null
         pulse?.cancel()
         barAnim?.cancel()
         root?.animate()?.cancel()
@@ -488,6 +499,71 @@ class Hud(private val context: Context) {
         val showPanel = !compact && calibOpen
         panel?.visibility = if (showPanel) View.VISIBLE else View.GONE
         if (showPanel) showFrame() else hideFrame()
+        // La taille de la bulle change : on la recolle au bord une fois remesurée.
+        root?.post { snapToEdge(false) }
+    }
+
+    private fun screenSize(): Pair<Int, Int> {
+        return if (Build.VERSION.SDK_INT >= 30) {
+            val b = wm.currentWindowMetrics.bounds
+            Pair(b.width(), b.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    /** Recolle la bulle au bord gauche ou droit le plus proche (jamais au milieu de l'écran). */
+    private fun snapToEdge(animate: Boolean) {
+        val card = root ?: return
+        val p = params ?: return
+        val w = card.width
+        val h = card.height
+        if (w <= 0 || h <= 0) return
+
+        val (sw, sh) = screenSize()
+        val margin = dp(8)
+        val centerX = p.x + w / 2
+        val targetX = if (centerX < sw / 2) margin else max(margin, sw - w - margin)
+        val targetY = p.y.coerceIn(margin, max(margin, sh - h - margin))
+
+        snapAnim?.cancel()
+        snapAnim = null
+
+        val startX = p.x
+        val startY = p.y
+        if (!animate || (startX == targetX && startY == targetY)) {
+            p.x = targetX
+            p.y = targetY
+            try {
+                wm.updateViewLayout(card, p)
+            } catch (t: Throwable) {
+            }
+            prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+            return
+        }
+
+        snapAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 260
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { a ->
+                val t = a.animatedValue as Float
+                p.x = (startX + (targetX - startX) * t).toInt()
+                p.y = (startY + (targetY - startY) * t).toInt()
+                try {
+                    wm.updateViewLayout(card, p)
+                } catch (e: Throwable) {
+                }
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+                }
+            })
+            start()
+        }
     }
 
     private fun setCount(count: Int, target: Int) {
@@ -593,6 +669,8 @@ class Hud(private val context: Context) {
             val p = params ?: return@setOnTouchListener false
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    snapAnim?.cancel()
+                    snapAnim = null
                     downX = e.rawX
                     downY = e.rawY
                     startX = p.x
@@ -616,7 +694,7 @@ class Hud(private val context: Context) {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (moved) {
-                        prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+                        snapToEdge(true)
                     } else {
                         toggleCompact()
                     }
