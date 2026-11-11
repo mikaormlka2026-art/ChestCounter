@@ -1,7 +1,8 @@
 package com.chestcounter.config
 
 /**
- * Paramètres des méthodes de vision classique (HSV, Canny, contours, géométrie, Hu, HOG, ORB).
+ * Paramètres des méthodes de vision classique (HSV, Canny, contours, géométrie, Hu, HOG, ORB,
+ * analyse temporelle : différence d'images, SSIM, flux optique).
  * Toutes les valeurs sont des points de départ NON calibrés : à régler avec de vraies
  * captures GeForce NOW. HSV à l'échelle OpenCV (H 0..179, S et V 0..255).
  */
@@ -65,5 +66,30 @@ data class ClassicalConfig(
     val orbMatchFull: Int = 25,
     val orbMinInliers: Int = 4,
     val orbRansacThresholdPx: Double = 3.0,
-    val orbEveryNFrames: Int = 1
+    val orbEveryNFrames: Int = 1,
+
+    // Temporel : ROI comparée entre deux instants, ramenée à temporalRoiPx sur son plus grand côté
+    val temporalEnabled: Boolean = true,
+    val temporalRoiPx: Int = 48,
+    /** Au-delà de cet écart entre deux observations, l'historique est oublié. */
+    val temporalMaxGapMs: Long = 1500L,
+    /** Écart de niveau de gris à partir duquel un pixel est considéré comme changé. */
+    val diffPixelThreshold: Int = 25,
+    val changeRatioMin: Float = 0.02f,
+    val changeRatioFull: Float = 0.25f,
+    /** SSIM au-dessus de ssimSame : aucun changement ; sous ssimChanged : changement fort. */
+    val ssimSame: Float = 0.90f,
+    val ssimChanged: Float = 0.50f,
+
+    // Flux optique (Lucas-Kanade)
+    val flowMaxCorners: Int = 30,
+    val flowQualityLevel: Double = 0.01,
+    val flowMinDistancePx: Double = 3.0,
+    val flowWinPx: Int = 11,
+    val flowPyrLevels: Int = 2,
+    val flowMinTracked: Int = 6,
+    /** Mouvement résiduel local (px de la ROI normalisée) qui donne motionScore = 1. */
+    val flowResidualFullPx: Float = 3.0f,
+    /** Au-delà de cette translation (px), la compensation de mouvement n'est pas fiable. */
+    val flowMaxTranslationPx: Float = 12.0f
 )
