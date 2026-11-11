@@ -1,7 +1,7 @@
 package com.chestcounter.config
 
 /**
- * Paramètres des méthodes de vision classique (lot 1 : HSV, Canny, contours, géométrie, Hu).
+ * Paramètres des méthodes de vision classique (HSV, Canny, contours, géométrie, Hu, HOG, ORB).
  * Toutes les valeurs sont des points de départ NON calibrés : à régler avec de vraies
  * captures GeForce NOW. HSV à l'échelle OpenCV (H 0..179, S et V 0..255).
  */
@@ -43,5 +43,27 @@ data class ClassicalConfig(
     val aspectMax: Float = 2.5f,
 
     // Hu : plus la valeur est grande, plus la similarité est tolérante
-    val huScale: Double = 1.0
+    val huScale: Double = 1.0,
+
+    // HOG : la ROI est mise à hogWinPx x hogWinPx avant extraction
+    val hogEnabled: Boolean = true,
+    val hogWinPx: Int = 64,
+    val hogCosMin: Float = 0.50f,
+    val hogCosFull: Float = 0.95f,
+    /** Exécuter HOG une frame sur N (1 = à chaque frame) pour économiser le CPU. */
+    val hogEveryNFrames: Int = 1,
+
+    // ORB : la ROI est ramenée à orbRoiSidePx sur son plus grand côté
+    val orbEnabled: Boolean = true,
+    val orbRoiSidePx: Int = 128,
+    val orbFeatures: Int = 200,
+    val orbEdgeThreshold: Int = 15,
+    val orbPatchSize: Int = 15,
+    val orbFastThreshold: Int = 10,
+    val orbRatio: Float = 0.75f,
+    val orbMinMatches: Int = 6,
+    val orbMatchFull: Int = 25,
+    val orbMinInliers: Int = 4,
+    val orbRansacThresholdPx: Double = 3.0,
+    val orbEveryNFrames: Int = 1
 )
