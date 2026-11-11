@@ -36,11 +36,13 @@ import com.chestcounter.data.ChestGoal
 import com.chestcounter.detect.ChestDetector
 import com.chestcounter.detect.ColorDetector
 import com.chestcounter.detect.TemplateKind
+import com.chestcounter.diagnostic.DiagnosticOverlay
 import com.chestcounter.fusion.ChestEngine
 import com.chestcounter.track.Track
 import com.chestcounter.ui.Hud
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -91,6 +93,9 @@ class CaptureService : Service() {
     private var collector: CaptureCollector? = null
     private var framePool: FramePool? = null
     private var hud: Hud? = null
+    private var overlay: DiagnosticOverlay? = null
+    private var hudJob: Job? = null
+    private var overlayJob: Job? = null
     private val engine = ChestEngine()
     private val colorDetector = ColorDetector()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -114,6 +119,7 @@ class CaptureService : Service() {
             ACTION_START -> startCapture(intent)
             ACTION_STOP -> stopCapture()
             ACTION_SAVE_TEMPLATE -> queueTemplate(intent)
+            ACTION_TOGGLE_DIAGNOSTIC -> toggleDiagnostic()
             else -> {
                 if (projection == null) stopSelf()
             }
@@ -230,6 +236,7 @@ class CaptureService : Service() {
         }
 
         startHud()
+        if (prefs().getBoolean(KEY_DIAGNOSTIC, false)) applyDiagnostic(true)
     }
 
     private fun resizeCapture() {
@@ -262,11 +269,51 @@ class CaptureService : Service() {
         } catch (t: Throwable) {
             hud = null
         }
+        hudJob?.cancel()
         val dao = AppDb.get(this).chestDao()
-        scope.launch {
+        hudJob = scope.launch {
             combine(status, dao.observeTotal()) { s, total -> hudText(s, total) }
                 .distinctUntilChanged()
                 .collect { text -> mainHandler.post { hud?.update(text) } }
+        }
+    }
+
+    private fun prefs() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun toggleDiagnostic() {
+        if (projection == null) {
+            stopSelf()
+            return
+        }
+        val enable = !prefs().getBoolean(KEY_DIAGNOSTIC, false)
+        if (enable && !Settings.canDrawOverlays(this)) {
+            publish { it.copy(message = "Autorisation d'affichage par-dessus les applis requise") }
+            return
+        }
+        prefs().edit().putBoolean(KEY_DIAGNOSTIC, enable).apply()
+        applyDiagnostic(enable)
+        publish { it.copy(message = if (enable) "Diagnostic activé" else "Diagnostic désactivé") }
+    }
+
+    private fun applyDiagnostic(enable: Boolean) {
+        if (enable) {
+            if (!Settings.canDrawOverlays(this)) return
+            val o = overlay ?: DiagnosticOverlay(this).also { overlay = it }
+            o.show()
+            if (overlayJob == null) {
+                overlayJob = scope.launch {
+                    status.collect { s ->
+                        mainHandler.post {
+                            overlay?.update(s.tracks, s.frameWidth, s.frameHeight)
+                        }
+                    }
+                }
+            }
+        } else {
+            overlayJob?.cancel()
+            overlayJob = null
+            overlay?.hide()
+            overlay = null
         }
     }
 
@@ -457,8 +504,15 @@ class CaptureService : Service() {
 
         collector = null
 
+        hudJob?.cancel()
+        hudJob = null
+        overlayJob?.cancel()
+        overlayJob = null
+
         try { hud?.hide() } catch (t: Throwable) { }
         hud = null
+        try { overlay?.hide() } catch (t: Throwable) { }
+        overlay = null
 
         publish { CaptureStatus(running = false, message = "Capture arrêtée") }
         try {
@@ -513,11 +567,16 @@ class CaptureService : Service() {
             this, 1, stopIntent(this),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val diagPi = PendingIntent.getService(
+            this, 2, toggleDiagnosticIntent(this),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notif_title))
             .setContentText(getString(R.string.notif_text))
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
+            .addAction(0, "Diagnostic", diagPi)
             .addAction(0, "Arrêter", stopPi)
             .build()
     }
@@ -530,6 +589,7 @@ class CaptureService : Service() {
         const val ACTION_START = "com.chestcounter.action.START"
         const val ACTION_STOP = "com.chestcounter.action.STOP"
         const val ACTION_SAVE_TEMPLATE = "com.chestcounter.action.SAVE_TEMPLATE"
+        const val ACTION_TOGGLE_DIAGNOSTIC = "com.chestcounter.action.TOGGLE_DIAGNOSTIC"
 
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
@@ -543,6 +603,8 @@ class CaptureService : Service() {
         private const val NOTIF_ID = 1001
         private const val INTERVAL_MS = 200L
         private const val MAX_CAPTURE_SIDE = 1280
+        private const val PREFS_NAME = "capture_prefs"
+        private const val KEY_DIAGNOSTIC = "diagnostic"
 
         private val _status = MutableStateFlow(CaptureStatus())
         val status: StateFlow<CaptureStatus> = _status.asStateFlow()
@@ -555,6 +617,9 @@ class CaptureService : Service() {
 
         fun stopIntent(context: Context): Intent =
             Intent(context, CaptureService::class.java).setAction(ACTION_STOP)
+
+        fun toggleDiagnosticIntent(context: Context): Intent =
+            Intent(context, CaptureService::class.java).setAction(ACTION_TOGGLE_DIAGNOSTIC)
 
         fun templateIntent(
             context: Context,
