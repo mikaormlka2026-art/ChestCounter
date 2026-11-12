@@ -39,6 +39,7 @@ import com.chestcounter.detect.ColorDetector
 import com.chestcounter.detect.TemplateKind
 import com.chestcounter.diagnostic.DiagnosticOverlay
 import com.chestcounter.fusion.ChestEngine
+import com.chestcounter.fusion.CountDeduplicator
 import com.chestcounter.track.Track
 import com.chestcounter.ui.Hud
 import kotlinx.coroutines.CoroutineScope
@@ -76,7 +77,8 @@ data class CaptureStatus(
     val frameHeight: Int = 0,
     val framesReceived: Int = 0,
     val blackFrames: Int = 0,
-    val lastFrameBlack: Boolean = false
+    val lastFrameBlack: Boolean = false,
+    val diagnosticLines: List<String> = emptyList()
 )
 
 class CaptureService : Service() {
@@ -100,7 +102,12 @@ class CaptureService : Service() {
     private var overlay: DiagnosticOverlay? = null
     private var hudJob: Job? = null
     private var overlayJob: Job? = null
-    private val engine = ChestEngine()
+    private val advanced = AdvancedAnalysis()
+    private val engine = ChestEngine(
+        dedup = CountDeduplicator(windowMs = 3000L),
+        countGate = { id, t -> advanced.countGate(id, t) },
+        onReset = { advanced.reset() }
+    )
     private val colorDetector = ColorDetector()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -451,6 +458,7 @@ class CaptureService : Service() {
         }
 
         val out = engine.process(r.detections, now) { box -> colorDetector.score(bmp, box) }
+        val diagLines = advanced.afterEngine(d, r, out, now, frames) { id -> engine.phaseOf(id)?.name }
 
         for (e in out.events) lastPhase = e.to.name
         if (out.tracks.isEmpty()) lastPhase = "IDLE"
@@ -494,6 +502,7 @@ class CaptureService : Service() {
                 savedCaptures = savedCount,
                 collectorError = colError,
                 tracks = out.tracks,
+                diagnosticLines = diagLines,
                 frameWidth = bmp.width,
                 frameHeight = bmp.height
             )
