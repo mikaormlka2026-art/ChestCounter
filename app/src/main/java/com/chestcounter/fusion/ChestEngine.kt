@@ -25,15 +25,27 @@ data class EngineOutput(
 class ChestEngine(
     private val cfg: EngineConfig = EngineConfig(),
     private val tracker: ChestTracker = ChestTracker(),
-    private val phases: ChestPhaseTracker = ChestPhaseTracker()
+    private val phases: ChestPhaseTracker = ChestPhaseTracker(),
+    /** Anti-double comptage par position et par temps (null = désactivé). */
+    private val dedup: CountDeduplicator? = null,
+    /** Dernier contrôle avant de compter (par exemple, preuve temporelle) : (identifiant, instant) -> autorisé. */
+    private val countGate: (Int, Long) -> Boolean = { _, _ -> true },
+    /** Appelé à chaque reset() pour remettre à zéro les modules associés. */
+    private val onReset: (() -> Unit)? = null
 ) {
     var count: Int = 0
         private set
     var lastConfidence: Float = 0f
         private set
+    var suppressedDuplicates: Int = 0
+        private set
+    var gatedCounts: Int = 0
+        private set
 
     private val counted = HashSet<Int>()
     private val closedPeak = HashMap<Int, Float>()
+
+    fun phaseOf(trackId: Int): ChestPhase? = phases.phaseOf(trackId)
 
     fun process(
         detections: List<Detection>,
@@ -59,9 +71,21 @@ class ChestEngine(
         val newly = ArrayList<CountedChest>()
         for (e in events) {
             if (e.to == ChestPhase.OPENED && e.sawClosed && counted.add(e.trackId)) {
-                val open = upd.tracks.firstOrNull { it.id == e.trackId }?.score ?: 0f
+                val track = upd.tracks.firstOrNull { it.id == e.trackId }
+                val open = track?.score ?: 0f
                 val closed = closedPeak[e.trackId] ?: open
                 val conf = (closed + open) / 2f
+
+                if (!countGate(e.trackId, nowMs)) {
+                    gatedCounts++
+                    continue
+                }
+                if (dedup != null && track != null && dedup.isDuplicate(track.box, nowMs)) {
+                    suppressedDuplicates++
+                    continue
+                }
+                if (dedup != null && track != null) dedup.remember(track.box, nowMs)
+
                 count++
                 lastConfidence = conf
                 newly.add(CountedChest(e.trackId, conf))
@@ -80,8 +104,12 @@ class ChestEngine(
         phases.reset()
         counted.clear()
         closedPeak.clear()
+        dedup?.reset()
         count = 0
         lastConfidence = 0f
+        suppressedDuplicates = 0
+        gatedCounts = 0
+        onReset?.invoke()
     }
 
     private fun resolve(items: List<Detection>): List<Detection> {
