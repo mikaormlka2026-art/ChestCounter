@@ -149,5 +149,23 @@ fun DiagnosticScreen(
                 }
             }
         }
+
+        SectionCard("Analyse par candidat") {
+            if (status.diagnosticLines.isEmpty()) {
+                Text(
+                    "Aucune analyse pour l'instant",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Palette.TextDim
+                )
+            } else {
+                status.diagnosticLines.forEach { line ->
+                    Text(
+                        line,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (line.startsWith("#")) Palette.TextPrimary else Palette.TextDim
+                    )
+                }
+            }
+        }
     }
 }
