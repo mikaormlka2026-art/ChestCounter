@@ -2,10 +2,18 @@ package com.chestcounter.detect
 
 enum class DetectionKind { CLOSED, OPEN }
 
+/** Résultat de l'analyse classique d'un candidat (null si le candidat n'a pas été analysé). */
+data class CandidateAnalysis(
+    val roi: RoiScores?,
+    val outcome: FusionOutcome?,
+    val vetoed: Boolean
+)
+
 data class Detection(
     val kind: DetectionKind,
     val box: BoundingBox,
-    val score: Float
+    val score: Float,
+    val analysis: CandidateAnalysis? = null
 )
 
 data class DetectionResult(
@@ -15,7 +23,10 @@ data class DetectionResult(
     val error: String? = null,
     val detections: List<Detection> = emptyList(),
     val frameWidth: Int = 0,
-    val frameHeight: Int = 0
+    val frameHeight: Int = 0,
+    /** Candidats écartés par le garde-fou (gardés pour le diagnostic). */
+    val vetoed: List<Detection> = emptyList(),
+    val analysisUs: Long = 0L
 )
 
 fun nonMaxSuppression(
