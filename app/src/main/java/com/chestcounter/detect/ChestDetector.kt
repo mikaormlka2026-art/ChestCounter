@@ -2,6 +2,10 @@ package com.chestcounter.detect
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import com.chestcounter.config.ClassicalConfig
+import com.chestcounter.config.DetectionConfig
+import com.chestcounter.config.FusionMode
+import com.chestcounter.config.PipelineConfig
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -28,11 +32,20 @@ private class ScaledTemplates(val factor: Double, val mats: List<Mat>) {
 
 private class MatchOutcome(val best: Float, val detections: List<Detection>)
 
+private class AnalysisBatch(
+    val kept: List<Detection>,
+    val vetoed: List<Detection>,
+    val micros: Long
+)
+
 class ChestDetector(
     private val targetWidth: Int = 480,
     private val scales: DoubleArray = doubleArrayOf(0.8, 1.0, 1.25),
     private val listThreshold: Float = 0.5f,
-    private val maxPerKind: Int = 8
+    private val maxPerKind: Int = 8,
+    private val pipeline: PipelineConfig = PipelineConfig(),
+    private val classical: ClassicalConfig = ClassicalConfig(),
+    detectionConfig: DetectionConfig = DetectionConfig()
 ) {
     private var ready = false
     private var closedGray: Mat? = null
@@ -42,6 +55,9 @@ class ChestDetector(
     private var rgbaBuf: Mat? = null
     private var grayBuf: Mat? = null
     private var smallBuf: Mat? = null
+    private var roiAnalyzer: RoiAnalyzer? = null
+    private var temporal: TemporalAnalyzer? = null
+    private val fusionEngine = EvidenceFusionEngine(detectionConfig)
 
     @Synchronized
     fun init(): Boolean {
@@ -54,6 +70,10 @@ class ChestDetector(
             rgbaBuf = Mat()
             grayBuf = Mat()
             smallBuf = Mat()
+        }
+        if (ready && roiAnalyzer == null) {
+            roiAnalyzer = RoiAnalyzer(classical)
+            temporal = TemporalAnalyzer(classical)
         }
         return ready
     }
@@ -77,6 +97,12 @@ class ChestDetector(
                 openScaled?.release()
                 openScaled = null
             }
+        }
+        // Références des méthodes classiques (Hu, HOG, ORB) : le même modèle que le template matching.
+        try {
+            roiAnalyzer?.setReference(kind.detectionKind, bitmap)
+        } catch (t: Throwable) {
+            // les méthodes sans référence restent simplement indisponibles
         }
     }
 
@@ -162,13 +188,34 @@ class ChestDetector(
                 all.addAll(r.detections)
             }
 
+            val batch = analyzeCandidates(rgba, all)
+
             DetectionResult(
                 closedBest, openBest, elapsed(), null,
-                all, frame.width, frame.height
+                batch.kept, frame.width, frame.height,
+                vetoed = batch.vetoed, analysisUs = batch.micros
             )
         } catch (t: Throwable) {
             DetectionResult(0f, 0f, elapsed(), "Erreur détection : ${t.message}")
         }
+    }
+
+    /**
+     * Analyse temporelle d'un coffre SUIVI sur la dernière image traitée par detect().
+     * À appeler juste après detect(), sur le même fil. null si indisponible.
+     */
+    @Synchronized
+    fun analyzeTemporal(trackId: Int, box: BoundingBox, nowMs: Long): TemporalScores? {
+        if (!ready || !pipeline.temporalEnabled) return null
+        val t = temporal ?: return null
+        val rgba = rgbaBuf ?: return null
+        if (rgba.empty()) return null
+        return t.analyze(rgba, box, trackId, nowMs)
+    }
+
+    @Synchronized
+    fun forgetTrack(trackId: Int) {
+        temporal?.forget(trackId)
     }
 
     @Synchronized
@@ -180,6 +227,8 @@ class ChestDetector(
         rgbaBuf?.release()
         grayBuf?.release()
         smallBuf?.release()
+        roiAnalyzer?.release()
+        temporal?.release()
         closedGray = null
         openGray = null
         closedScaled = null
@@ -187,7 +236,49 @@ class ChestDetector(
         rgbaBuf = null
         grayBuf = null
         smallBuf = null
+        roiAnalyzer = null
+        temporal = null
         ready = false
+    }
+
+    /**
+     * Analyse classique des meilleurs candidats (HSV, contours, Hu, HOG, ORB), puis fusion des preuves.
+     * Cadence adaptative : seuls les candidats assez forts sont analysés, en nombre limité et dans un budget de temps.
+     * En mode VETO, un candidat contredit par plusieurs canaux indépendants est retiré de la liste.
+     */
+    private fun analyzeCandidates(rgba: Mat, all: List<Detection>): AnalysisBatch {
+        val analyzer = roiAnalyzer
+        if (analyzer == null || pipeline.fusionMode == FusionMode.OFF || all.isEmpty()) {
+            return AnalysisBatch(all, emptyList(), 0L)
+        }
+        val t0 = System.nanoTime()
+        analyzer.beginFrame()
+
+        val order = all.indices
+            .filter { all[it].score >= pipeline.analyzeMinScore }
+            .sortedByDescending { all[it].score }
+            .take(pipeline.maxAnalyzedPerFrame)
+
+        val updated = ArrayList<Detection>(all)
+        val vetoedIdx = HashSet<Int>()
+        for (idx in order) {
+            if ((System.nanoTime() - t0) / 1_000_000L > pipeline.analysisBudgetMs) break
+            val d = all[idx]
+            val roi = analyzer.analyze(rgba, d.box, d.kind)
+            val outcome = fusionEngine.evaluate(CandidateEvidence(d.score, roi))
+            val veto = pipeline.fusionMode == FusionMode.VETO &&
+                outcome.status == CandidateStatus.REJECTED &&
+                outcome.reasons.any { it.contains(VETO_MARK) }
+            updated[idx] = d.copy(analysis = CandidateAnalysis(roi, outcome, veto))
+            if (veto) vetoedIdx.add(idx)
+        }
+
+        val kept = ArrayList<Detection>(updated.size)
+        val dropped = ArrayList<Detection>()
+        for (i in updated.indices) {
+            if (i in vetoedIdx) dropped.add(updated[i]) else kept.add(updated[i])
+        }
+        return AnalysisBatch(kept, dropped, (System.nanoTime() - t0) / 1000L)
     }
 
     private fun bitmapToGray(b: Bitmap): Mat {
@@ -293,5 +384,10 @@ class ChestDetector(
             n++
         }
         return first
+    }
+
+    private companion object {
+        /** Mot présent dans la raison de rejet par contradiction (voir EvidenceFusionEngine). */
+        const val VETO_MARK = "contredisent"
     }
 }
