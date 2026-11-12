@@ -12,14 +12,28 @@ data class Track(
     val firstSeenMs: Long,
     val lastSeenMs: Long,
     val hits: Int,
-    val visible: Boolean
+    val visible: Boolean,
+    /** Vitesse estimée du centre, en pixels par seconde. */
+    val velocityX: Float = 0f,
+    val velocityY: Float = 0f,
+    /** Nombre de mises à jour du suivi depuis la création de la piste. */
+    val age: Int = 0,
+    /** Images consécutives sans détection associée. */
+    val missedFrames: Int = 0
 )
 
 data class TrackerConfig(
     val minIou: Float = 0.3f,
     val minHits: Int = 2,
     val maxLostMs: Long = 1500L,
-    val smoothing: Float = 0.5f
+    val smoothing: Float = 0.5f,
+    /** Associe les détections à la position PRÉDITE par Kalman (utile quand la caméra bouge). */
+    val useKalman: Boolean = true,
+    val kalman: KalmanConfig = KalmanConfig(),
+    /** Plafond de l'extrapolation d'une piste non vue. */
+    val maxPredictMs: Long = 600L,
+    /** true : la boîte publiée est la boîte filtrée par Kalman au lieu du lissage simple. */
+    val kalmanSmoothsBox: Boolean = false
 )
 
 data class TrackerUpdate(
@@ -37,7 +51,10 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
         val firstSeenMs: Long,
         var lastSeenMs: Long,
         var hits: Int,
-        var confirmed: Boolean
+        var confirmed: Boolean,
+        val kalman: KalmanBoxFilter,
+        var age: Int = 1,
+        var missed: Int = 0
     )
 
     private val entries = ArrayList<Entry>()
@@ -46,8 +63,9 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
     fun update(detections: List<Detection>, nowMs: Long): TrackerUpdate {
         val pairs = ArrayList<Triple<Float, Int, Int>>()
         for (ei in entries.indices) {
+            val ref = reference(entries[ei], nowMs)
             for (di in detections.indices) {
-                val a = affinity(entries[ei].box, detections[di].box)
+                val a = affinity(ref, detections[di].box)
                 if (a > 0f) pairs.add(Triple(a, ei, di))
             }
         }
@@ -61,12 +79,22 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
             usedDetection[di] = true
             val e = entries[ei]
             val d = detections[di]
-            e.box = blend(e.box, d.box)
+            e.kalman.update(d.box, nowMs)
+            e.box = if (cfg.useKalman && cfg.kalmanSmoothsBox) e.kalman.box() else blend(e.box, d.box)
             e.kind = d.kind
             e.score = d.score
             e.lastSeenMs = nowMs
             e.hits++
+            e.age++
+            e.missed = 0
             if (e.hits >= cfg.minHits) e.confirmed = true
+        }
+
+        for (ei in entries.indices) {
+            if (!usedEntry[ei]) {
+                entries[ei].missed++
+                entries[ei].age++
+            }
         }
 
         for (di in detections.indices) {
@@ -75,7 +103,8 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
             entries.add(
                 Entry(
                     nextId++, d.kind, d.box, d.score,
-                    nowMs, nowMs, 1, cfg.minHits <= 1
+                    nowMs, nowMs, 1, cfg.minHits <= 1,
+                    KalmanBoxFilter(d.box, nowMs, cfg.kalman)
                 )
             )
         }
@@ -93,10 +122,17 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
         val tracks = entries
             .filter { it.confirmed }
             .map {
+                val visible = it.lastSeenMs == nowMs
+                val box = if (!visible && cfg.useKalman) {
+                    it.kalman.predictedBox(nowMs, cfg.maxPredictMs)
+                } else {
+                    it.box
+                }
                 Track(
-                    it.id, it.kind, it.box, it.score,
+                    it.id, it.kind, box, it.score,
                     it.firstSeenMs, it.lastSeenMs, it.hits,
-                    it.lastSeenMs == nowMs
+                    visible,
+                    it.kalman.vx, it.kalman.vy, it.age, it.missed
                 )
             }
         return TrackerUpdate(tracks, lost)
@@ -106,6 +142,10 @@ class ChestTracker(private val cfg: TrackerConfig = TrackerConfig()) {
         entries.clear()
         nextId = 1
     }
+
+    /** Boîte de référence pour l'association : position prédite si Kalman est actif. */
+    private fun reference(e: Entry, nowMs: Long): BoundingBox =
+        if (cfg.useKalman) e.kalman.predictedBox(nowMs, cfg.maxPredictMs) else e.box
 
     private fun affinity(a: BoundingBox, b: BoundingBox): Float {
         val iou = a.iou(b)
