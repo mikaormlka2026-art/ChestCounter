@@ -114,7 +114,7 @@ private fun ZonePreview(left: Int, top: Int, right: Int, bottom: Int) {
             .fillMaxWidth()
             .aspectRatio(16f / 9f)
             .clip(RoundedCornerShape(12.dp))
-            .background(Palette.Background)
+            .background(Palette.Navy)
     ) {
         Canvas(Modifier.fillMaxSize()) {
             val x = size.width * left / 100f
