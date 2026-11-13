@@ -108,8 +108,18 @@ class SessionRecorder(
                                     else -> null
                                 }
                                 dao.finishSession(
-                                    sessionId, SessionStatus.COMPLETED, cmd.wallMs, cmd.received,
-                                    cmd.processed, stored, d, cmd.provisional, cmd.width, cmd.height, reason
+                                    id = sessionId,
+                                    expected = SessionStatus.RUNNING,
+                                    status = SessionStatus.COMPLETED,
+                                    wallMs = cmd.wallMs,
+                                    received = cmd.received,
+                                    processed = cmd.processed,
+                                    observations = stored,
+                                    dropped = d,
+                                    provisional = cmd.provisional,
+                                    width = cmd.width,
+                                    height = cmd.height,
+                                    reason = reason
                                 )
                             }
                             return@launch
