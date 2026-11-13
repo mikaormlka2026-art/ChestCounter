@@ -10,6 +10,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import com.chestcounter.data.AnalysisResult
+import com.chestcounter.data.SessionAnalysisRunner
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -35,6 +42,16 @@ fun HomeScreen(
     onStop: () -> Unit,
     onGrantOverlay: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val analyzing = remember { mutableStateOf(false) }
+    val outcome = remember { mutableStateOf<com.chestcounter.data.AnalysisOutcome?>(null) }
+    val info = remember { mutableStateOf("") }
+
+    outcome.value?.let { o ->
+        SessionReportDialog(o) { outcome.value = null }
+    }
+
     ScreenColumn {
         Text(
             "CHEST COUNTER",
@@ -66,6 +83,33 @@ fun HomeScreen(
                 SecondaryButton("Arrêter la capture", onStop, Modifier.fillMaxWidth())
             } else {
                 PrimaryButton("Démarrer la capture", onStart, Modifier.fillMaxWidth())
+            }
+            Spacer(Modifier.height(Spacing.s))
+            SecondaryButton(
+                if (analyzing.value) "Analyse en cours…" else "Partie terminée",
+                {
+                    if (!analyzing.value) {
+                        val wasRunning = status.running
+                        if (wasRunning) onStop()
+                        analyzing.value = true
+                        info.value = ""
+                        scope.launch {
+                            val res = SessionAnalysisRunner.analyzeLatest(context, wasRunning)
+                            analyzing.value = false
+                            when (res) {
+                                is AnalysisResult.Done -> outcome.value = res.outcome
+                                is AnalysisResult.NoSession -> info.value = "Aucune session enregistrée."
+                                is AnalysisResult.Failed -> info.value = "Analyse impossible : ${res.message}"
+                            }
+                        }
+                    }
+                },
+                Modifier.fillMaxWidth(),
+                enabled = !analyzing.value
+            )
+            if (info.value.isNotEmpty()) {
+                Spacer(Modifier.height(Spacing.s))
+                Text(info.value, style = MaterialTheme.typography.bodyMedium, color = Palette.Danger)
             }
             Spacer(Modifier.height(Spacing.s))
             if (overlayOk) {
