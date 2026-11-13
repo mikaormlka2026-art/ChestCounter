@@ -34,6 +34,7 @@ import com.chestcounter.data.AppDb
 import com.chestcounter.data.CaptureCollector
 import com.chestcounter.data.ChestEvent
 import com.chestcounter.data.ChestGoal
+import com.chestcounter.data.SessionRecorder // LOT 2
 import com.chestcounter.detect.ChestDetector
 import com.chestcounter.detect.ColorDetector
 import com.chestcounter.detect.TemplateKind
@@ -98,6 +99,7 @@ class CaptureService : Service() {
     private var detector: ChestDetector? = null
     private var collector: CaptureCollector? = null
     private var framePool: FramePool? = null
+    private var recorder: SessionRecorder? = null // LOT 2
     private var hud: Hud? = null
     private var overlay: DiagnosticOverlay? = null
     private var hudJob: Job? = null
@@ -198,6 +200,7 @@ class CaptureService : Service() {
             return
         }
         projection = mp
+        recorder = SessionRecorder(applicationContext).also { it.begin() } // LOT 2
 
         val ht = HandlerThread("ChestCapture").also { it.start() }
         thread = ht
@@ -421,6 +424,7 @@ class CaptureService : Service() {
         if (needsReset) {
             needsReset = false
             engine.reset()
+            recorder?.onEngineReset() // LOT 2
             lastPhase = "IDLE"
         }
 
@@ -458,6 +462,7 @@ class CaptureService : Service() {
         }
 
         val out = engine.process(r.detections, now) { box -> colorDetector.score(bmp, box) }
+        recorder?.onFrame(now, out.tracks, bmp.width, bmp.height) { id -> engine.phaseOf(id)?.name } // LOT 2
         val diagLines = advanced.afterEngine(d, r, out, now, frames) { id -> engine.phaseOf(id)?.name }
 
         for (e in out.events) lastPhase = e.to.name
@@ -466,6 +471,7 @@ class CaptureService : Service() {
         val counted = out.newlyCounted.isNotEmpty()
         for (c in out.newlyCounted) {
             val confidence = c.confidence
+            recorder?.onOpening(c.trackId, now, confidence) // LOT 2
             scope.launch {
                 try {
                     AppDb.get(applicationContext).chestDao().insert(
@@ -543,6 +549,7 @@ class CaptureService : Service() {
         val ok = d.saveTemplate(templatesDir(), p.kind, crop)
         crop.recycle()
         engine.reset()
+        recorder?.onEngineReset() // LOT 2
         lastPhase = "IDLE"
         publish {
             it.copy(
@@ -558,6 +565,8 @@ class CaptureService : Service() {
         if (stopping) return
         stopping = true
         pending = null
+        recorder?.finish(received, frames, engine.count) // LOT 2
+        recorder = null // LOT 2
 
         try { virtualDisplay?.release() } catch (t: Throwable) { }
         virtualDisplay = null
