@@ -9,6 +9,8 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 object ChestGoal {
@@ -49,12 +51,77 @@ interface ChestDao {
     suspend fun deleteAll()
 }
 
-@Database(entities = [ChestEvent::class], version = 1, exportSchema = false)
+@Database(
+    entities = [ChestEvent::class, SessionEntity::class, ObservationEntity::class, OpeningRecord::class],
+    version = 2,
+    exportSchema = false
+)
 abstract class AppDb : RoomDatabase() {
 
     abstract fun chestDao(): ChestDao
+    abstract fun sessionDao(): SessionDao
 
     companion object {
+        /** 1 -> 2 : ajout des tables de session. chest_events n'est PAS touchée. */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `game_sessions` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`startedWallMs` INTEGER NOT NULL, " +
+                        "`startedMonoMs` INTEGER NOT NULL, " +
+                        "`endedWallMs` INTEGER, " +
+                        "`status` TEXT NOT NULL, " +
+                        "`engineVersion` TEXT NOT NULL, " +
+                        "`frameWidth` INTEGER NOT NULL, " +
+                        "`frameHeight` INTEGER NOT NULL, " +
+                        "`framesReceived` INTEGER NOT NULL, " +
+                        "`framesProcessed` INTEGER NOT NULL, " +
+                        "`observationCount` INTEGER NOT NULL, " +
+                        "`droppedObservations` INTEGER NOT NULL, " +
+                        "`provisionalCount` INTEGER NOT NULL, " +
+                        "`incompleteReason` TEXT)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `chest_observations` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`sessionId` INTEGER NOT NULL, " +
+                        "`epoch` INTEGER NOT NULL, " +
+                        "`tMonoMs` INTEGER NOT NULL, " +
+                        "`trackId` INTEGER NOT NULL, " +
+                        "`kind` TEXT NOT NULL, " +
+                        "`left` REAL NOT NULL, " +
+                        "`top` REAL NOT NULL, " +
+                        "`right` REAL NOT NULL, " +
+                        "`bottom` REAL NOT NULL, " +
+                        "`score` REAL NOT NULL, " +
+                        "`visible` INTEGER NOT NULL, " +
+                        "`phase` TEXT)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chest_observations_sessionId_tMonoMs` " +
+                        "ON `chest_observations` (`sessionId`, `tMonoMs`)"
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `opening_records` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`sessionId` INTEGER NOT NULL, " +
+                        "`epoch` INTEGER NOT NULL, " +
+                        "`trackId` INTEGER NOT NULL, " +
+                        "`tMonoMs` INTEGER NOT NULL, " +
+                        "`wallMs` INTEGER NOT NULL, " +
+                        "`confidence` REAL NOT NULL, " +
+                        "`source` TEXT NOT NULL, " +
+                        "`attribution` TEXT NOT NULL, " +
+                        "`reason` TEXT)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_opening_records_sessionId` " +
+                        "ON `opening_records` (`sessionId`)"
+                )
+            }
+        }
+
         @Volatile
         private var instance: AppDb? = null
 
@@ -64,7 +131,10 @@ abstract class AppDb : RoomDatabase() {
                     context.applicationContext,
                     AppDb::class.java,
                     "chestcounter.db"
-                ).build().also { instance = it }
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    .build()
+                    .also { instance = it }
             }
         }
     }
