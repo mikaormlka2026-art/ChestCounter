@@ -4,17 +4,17 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,21 +23,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -57,7 +55,8 @@ fun ScreenColumn(content: @Composable ColumnScope.() -> Unit) {
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             content()
-            Spacer(Modifier.height(Spacing.xl))
+            // Place pour la barre de navigation flottante.
+            Spacer(Modifier.height(96.dp))
         }
     }
 }
@@ -68,21 +67,14 @@ fun SectionCard(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Surface(
-        modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large,
-        color = Palette.Surface,
-        contentColor = Palette.TextPrimary
-    ) {
-        Column(Modifier.padding(Spacing.l)) {
-            Text(
-                title.uppercase(),
-                style = MaterialTheme.typography.labelSmall,
-                color = Palette.TextDim
-            )
-            Spacer(Modifier.height(Spacing.m))
-            content()
-        }
+    GlassCard(modifier) {
+        Text(
+            title.uppercase(),
+            style = MaterialTheme.typography.labelSmall,
+            color = Palette.TextDim
+        )
+        Spacer(Modifier.height(Spacing.m))
+        content()
     }
 }
 
@@ -93,20 +85,13 @@ fun PrimaryButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
-    Button(
+    GlassButton(
+        label = label,
         onClick = onClick,
-        modifier = modifier.heightIn(min = 48.dp),
+        modifier = modifier,
         enabled = enabled,
-        shape = RoundedCornerShape(14.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = Palette.Primary,
-            contentColor = Palette.TextPrimary,
-            disabledContainerColor = Palette.SurfaceHigh,
-            disabledContentColor = Palette.TextDim
-        )
-    ) {
-        Text(label, style = MaterialTheme.typography.labelLarge)
-    }
+        kind = GlassButtonKind.PRIMARY
+    )
 }
 
 @Composable
@@ -117,42 +102,31 @@ fun SecondaryButton(
     enabled: Boolean = true,
     contentColor: Color = Palette.TextPrimary
 ) {
-    Button(
+    GlassButton(
+        label = label,
         onClick = onClick,
-        modifier = modifier.heightIn(min = 48.dp),
+        modifier = modifier,
         enabled = enabled,
-        shape = RoundedCornerShape(14.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = Palette.SurfaceHigh,
-            contentColor = contentColor,
-            disabledContainerColor = Palette.SurfaceHigh,
-            disabledContentColor = Palette.TextDim
-        )
-    ) {
-        Text(label, style = MaterialTheme.typography.labelLarge)
-    }
+        kind = GlassButtonKind.GLASS,
+        contentColor = contentColor
+    )
 }
 
 @Composable
 fun StatusPill(text: String, color: Color, modifier: Modifier = Modifier) {
-    Surface(
-        modifier,
-        shape = CircleShape,
-        color = color.copy(alpha = 0.16f),
-        contentColor = color
+    Row(
+        modifier
+            .glass(RoundedCornerShape(20.dp))
+            .padding(horizontal = Spacing.m, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            Modifier.padding(horizontal = Spacing.m, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                Modifier
-                    .size(8.dp)
-                    .background(color, CircleShape)
-            )
-            Spacer(Modifier.width(Spacing.s))
-            Text(text, style = MaterialTheme.typography.labelMedium)
-        }
+        Box(
+            Modifier
+                .size(8.dp)
+                .background(color, CircleShape)
+        )
+        Spacer(Modifier.width(Spacing.s))
+        Text(text, style = MaterialTheme.typography.labelMedium, color = Palette.Navy)
     }
 }
 
@@ -163,17 +137,17 @@ fun MetricTile(
     modifier: Modifier = Modifier,
     valueColor: Color = Palette.TextPrimary
 ) {
-    Surface(
-        modifier,
-        shape = MaterialTheme.shapes.medium,
-        color = Palette.SurfaceHigh,
-        contentColor = Palette.TextPrimary
+    val shape = RoundedCornerShape(18.dp)
+    Column(
+        modifier
+            .clip(shape)
+            .background(Color(0x66FFFFFF), shape)
+            .border(1.dp, Color(0x99FFFFFF), shape)
+            .padding(Spacing.m)
     ) {
-        Column(Modifier.padding(Spacing.m)) {
-            Text(label, style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
-            Spacer(Modifier.height(Spacing.xs))
-            Text(value, style = MaterialTheme.typography.titleMedium, color = valueColor)
-        }
+        Text(label, style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
+        Spacer(Modifier.height(Spacing.xs))
+        Text(value, style = MaterialTheme.typography.titleMedium, color = valueColor)
     }
 }
 
@@ -220,7 +194,7 @@ fun ProgressRing(
             val topLeft = Offset((size.width - d) / 2f, (size.height - d) / 2f)
             val arcSize = Size(d, d)
             drawArc(
-                color = Palette.SurfaceHigh,
+                color = Color(0x66FFFFFF),
                 startAngle = -90f,
                 sweepAngle = 360f,
                 useCenter = false,
@@ -230,7 +204,7 @@ fun ProgressRing(
             )
             if (animated > 0f) {
                 drawArc(
-                    brush = Brush.linearGradient(listOf(Palette.Primary, Palette.PrimaryLight)),
+                    brush = Palette.AccentBrush,
                     startAngle = -90f,
                     sweepAngle = 360f * animated,
                     useCenter = false,
@@ -271,16 +245,13 @@ fun Stepper(
 
 @Composable
 private fun StepButton(symbol: String, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier.size(48.dp),
-        shape = RoundedCornerShape(12.dp),
-        contentPadding = PaddingValues(0.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = Palette.SurfaceHigh,
-            contentColor = Palette.TextPrimary
-        )
+    Box(
+        Modifier
+            .size(48.dp)
+            .glass(RoundedCornerShape(14.dp))
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center
     ) {
-        Text(symbol, style = MaterialTheme.typography.titleMedium)
+        Text(symbol, style = MaterialTheme.typography.titleMedium, color = Palette.Navy)
     }
 }
