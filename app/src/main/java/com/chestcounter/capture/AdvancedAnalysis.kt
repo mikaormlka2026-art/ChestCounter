@@ -21,9 +21,16 @@ class AdvancedAnalysis(private val pipeline: PipelineConfig = PipelineConfig()) 
     private val log = PipelineLog(60) { line -> if (pipeline.logEnabled) Log.i(TAG, line) }
     private var lastVetoLogMs = -1L
 
-    /** Branché sur ChestEngine : autorise ou non un comptage selon la preuve temporelle. */
+    /**
+     * Branché sur ChestEngine : autorise ou non un comptage selon la preuve temporelle.
+     * Si la preuve est exigée, une preuve absente ou non mesurée REFUSE (jamais une autorisation).
+     */
     fun countGate(trackId: Int, nowMs: Long): Boolean =
-        transitions.gate(trackId, nowMs, pipeline.requireTemporalForCount, pipeline.minTransitionStrength)
+        if (pipeline.requireTemporalForCount) {
+            transitions.gateStrict(trackId, nowMs, pipeline.minTransitionStrength)
+        } else {
+            true
+        }
 
     fun reset() {
         transitions.clear()
