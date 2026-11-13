@@ -74,6 +74,16 @@ class TemporalTransitions(
         return s >= minStrength
     }
 
+    /**
+     * Version STRICTE du contrôle : sans transition observée ou sans mesure de changement, refuse.
+     * Une donnée manquante n'est jamais une preuve positive.
+     */
+    fun gateStrict(trackId: Int, nowMs: Long, minStrength: Float): Boolean {
+        val ev = evidence(trackId, nowMs) ?: return false
+        val s = ev.strength ?: return false
+        return s >= minStrength
+    }
+
     @Synchronized
     fun prune(nowMs: Long, maxAgeMs: Long = 10_000L) {
         val it = map.entries.iterator()
