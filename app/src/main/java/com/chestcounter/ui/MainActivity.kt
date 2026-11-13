@@ -14,25 +14,18 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
-import androidx.compose.material3.NavigationRail
-import androidx.compose.material3.NavigationRailItem
-import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,16 +33,23 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import com.chestcounter.capture.CaptureService
 import com.chestcounter.data.AppDb
 import com.chestcounter.data.CaptureCollector
 import com.chestcounter.data.ChestEvent
+import com.chestcounter.data.DayCount
 import com.chestcounter.detect.TemplateKind
+import com.chestcounter.ui.components.AuroraBackground
+import com.chestcounter.ui.components.GlassNavBar
+import com.chestcounter.ui.components.GlassNavRail
+import com.chestcounter.ui.components.NavEntry
 import com.chestcounter.ui.screens.CalibrationScreen
 import com.chestcounter.ui.screens.DiagnosticScreen
 import com.chestcounter.ui.screens.HistoryScreen
@@ -70,8 +70,6 @@ private enum class Tab(val label: String, val glyph: String) {
     SETTINGS("Réglages", "⚙")
 }
 
-private val NoInsets = WindowInsets(0, 0, 0, 0)
-
 private const val CAPTURE_PREFS = "capture_prefs"
 private const val KEY_DIAGNOSTIC = "diagnostic"
 
@@ -81,6 +79,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Fond clair : icônes sombres dans les barres système.
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = true
+            isAppearanceLightNavigationBars = true
+        }
         setContent { ChestTheme { App() } }
     }
 
@@ -93,12 +96,13 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
 
-    private fun startOfDay(): Long {
+    private fun startOfDay(daysAgo: Int = 0): Long {
         val c = Calendar.getInstance()
         c.set(Calendar.HOUR_OF_DAY, 0)
         c.set(Calendar.MINUTE, 0)
         c.set(Calendar.SECOND, 0)
         c.set(Calendar.MILLISECOND, 0)
+        c.add(Calendar.DAY_OF_YEAR, -daysAgo)
         return c.timeInMillis
     }
 
@@ -111,6 +115,8 @@ class MainActivity : ComponentActivity() {
         val status by CaptureService.status.collectAsState()
         val total by remember { dao.observeTotal() }.collectAsState(initial = 0)
         val today by remember { dao.observeSince(startOfDay()) }.collectAsState(initial = 0)
+        val daily by remember { dao.observeDailyCounts(startOfDay(6)) }
+            .collectAsState(initial = emptyList<DayCount>())
         val recent by remember { dao.observeRecent(50) }
             .collectAsState(initial = emptyList<ChestEvent>())
         val overlayOk = remember(resumeTick) { Settings.canDrawOverlays(this@MainActivity) }
@@ -219,6 +225,7 @@ class MainActivity : ComponentActivity() {
 
         val tabs = Tab.values()
         val current = tabIndex.coerceIn(0, tabs.size - 1)
+        val navItems = remember { tabs.map { NavEntry(it.label, it.glyph) } }
 
         val content: @Composable () -> Unit = {
             when (tabs[current]) {
@@ -229,7 +236,8 @@ class MainActivity : ComponentActivity() {
                     overlayOk = overlayOk,
                     onStart = { startCapture() },
                     onStop = { stopCapture() },
-                    onGrantOverlay = { grantOverlay() }
+                    onGrantOverlay = { grantOverlay() },
+                    daily = daily
                 )
 
                 Tab.CALIBRATION -> CalibrationScreen(
@@ -265,74 +273,53 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        val barColors = NavigationBarItemDefaults.colors(
-            selectedIconColor = Palette.TextPrimary,
-            selectedTextColor = Palette.TextPrimary,
-            indicatorColor = Palette.PrimaryContainer,
-            unselectedIconColor = Palette.TextDim,
-            unselectedTextColor = Palette.TextDim
-        )
-        val railColors = NavigationRailItemDefaults.colors(
-            selectedIconColor = Palette.TextPrimary,
-            selectedTextColor = Palette.TextPrimary,
-            indicatorColor = Palette.PrimaryContainer,
-            unselectedIconColor = Palette.TextDim,
-            unselectedTextColor = Palette.TextDim
-        )
+        // Transition douce entre les onglets.
+        val fade = remember { Animatable(0f) }
+        LaunchedEffect(current) {
+            fade.snapTo(0f)
+            fade.animateTo(1f, tween(260))
+        }
+        val animatedContent: @Composable () -> Unit = {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        alpha = fade.value
+                        translationY = (1f - fade.value) * 24f
+                    }
+            ) { content() }
+        }
 
         Surface(
             Modifier.fillMaxSize(),
-            color = MaterialTheme.colorScheme.background
+            color = Color.Transparent,
+            contentColor = Palette.Navy
         ) {
-            BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding()) {
-                if (maxWidth >= 600.dp) {
-                    Row(Modifier.fillMaxSize()) {
-                        NavigationRail(
-                            containerColor = Palette.Surface,
-                            windowInsets = NoInsets
-                        ) {
-                            tabs.forEachIndexed { i, tab ->
-                                NavigationRailItem(
-                                    selected = current == i,
-                                    onClick = { tabIndex = i },
-                                    icon = { Text(tab.glyph, fontSize = 18.sp) },
-                                    label = {
-                                        Text(
-                                            tab.label,
-                                            fontSize = 11.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    },
-                                    colors = railColors
-                                )
-                            }
+            AuroraBackground {
+                BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding()) {
+                    if (maxWidth >= 600.dp) {
+                        Row(Modifier.fillMaxSize()) {
+                            GlassNavRail(
+                                items = navItems,
+                                selected = current,
+                                onSelect = { tabIndex = it },
+                                modifier = Modifier
+                                    .padding(12.dp)
+                                    .align(Alignment.CenterVertically)
+                            )
+                            Box(Modifier.weight(1f).fillMaxHeight()) { animatedContent() }
                         }
-                        Box(Modifier.weight(1f).fillMaxHeight()) { content() }
-                    }
-                } else {
-                    Column(Modifier.fillMaxSize()) {
-                        Box(Modifier.weight(1f).fillMaxWidth()) { content() }
-                        NavigationBar(
-                            containerColor = Palette.Surface,
-                            windowInsets = NoInsets
-                        ) {
-                            tabs.forEachIndexed { i, tab ->
-                                NavigationBarItem(
-                                    selected = current == i,
-                                    onClick = { tabIndex = i },
-                                    icon = { Text(tab.glyph, fontSize = 18.sp) },
-                                    label = {
-                                        Text(
-                                            tab.label,
-                                            fontSize = 11.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    },
-                                    colors = barColors
-                                )
-                            }
+                    } else {
+                        Box(Modifier.fillMaxSize()) {
+                            animatedContent()
+                            GlassNavBar(
+                                items = navItems,
+                                selected = current,
+                                onSelect = { tabIndex = it },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                            )
                         }
                     }
                 }
