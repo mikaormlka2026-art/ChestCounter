@@ -141,7 +141,7 @@ fun DiagnosticScreen(
                         "#${t.id}  $kind  $seen",
                         "${(t.score * 100).toInt()} %",
                         valueColor = if (t.kind == DetectionKind.CLOSED) {
-                            Palette.Gold
+                            Palette.GoldText
                         } else {
                             Palette.Success
                         }
