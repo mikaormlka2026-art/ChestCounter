@@ -24,6 +24,9 @@ data class ChestEvent(
     val confidence: Float
 )
 
+/** Coffres comptés par jour (résultat de requête, pas une table). */
+data class DayCount(val day: String, val n: Int)
+
 @Dao
 interface ChestDao {
     @Insert
@@ -40,6 +43,13 @@ interface ChestDao {
 
     @Query("SELECT * FROM chest_events ORDER BY timestampMs DESC LIMIT :limit")
     fun observeRecent(limit: Int): Flow<List<ChestEvent>>
+
+    @Query(
+        "SELECT strftime('%Y-%m-%d', timestampMs / 1000, 'unixepoch', 'localtime') AS day, " +
+            "COUNT(*) AS n FROM chest_events WHERE timestampMs >= :sinceMs " +
+            "GROUP BY day ORDER BY day"
+    )
+    fun observeDailyCounts(sinceMs: Long): Flow<List<DayCount>>
 
     @Query(
         "DELETE FROM chest_events WHERE id = " +
